@@ -7,3 +7,4 @@
 
 from .tabicl import TabICL
 from .inference_config import InferenceConfig
+from .kernel_head import KernelHead, relative_perplexity

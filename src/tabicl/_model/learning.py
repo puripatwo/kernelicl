@@ -276,6 +276,82 @@ class ICLearning(nn.Module):
 
         return out
 
+    def embed(self, R: Tensor, y_train: Tensor, symmetric: bool = True) -> tuple[Optional[Tensor], Tensor]:
+        """In-context embeddings for kernel regression, skipping the MLP decoder.
+
+        This is the embedding function :math:`h_D` of KernelICL: it runs the ICL
+        transformer and returns its output rather than decoding it into logits.
+
+        Because :class:`~tabicl._model.layers.MultiheadAttentionBlock` derives
+        keys and values as ``q[..., :train_size, :]``, every position of the
+        sequence acts as a query while only the leading ``train_size`` positions
+        act as context. Training and test samples therefore receive different
+        treatment even for identical inputs: context positions carry the label
+        embedding ``g(y_train)``, query positions do not.
+
+        Symmetric mode restores :math:`q_D = k_D = h_D` by concatenating a second,
+        label-free copy of the training rows into the query stream::
+
+            [ R_train + g(y_train) | R_train | R_test ]
+              \\_____ context _____/ \\_____ queries ____/
+
+        Identical inputs then produce identical embeddings regardless of whether
+        they appeared in a context or a query position, which is what gives
+        distance-based kernels a geometric meaning. Note that the training
+        embeddings must *not* be read off the context positions instead: those
+        have their own label added, so a training sample's label would leak into
+        the embedding used to retrieve it.
+
+        The cost is a query sequence of ``2 * train_size + test_size`` instead of
+        ``train_size + test_size``; the number of keys is unchanged. Only the ICL
+        transformer pays this, since column-wise and row-wise embeddings are
+        position-agnostic and are computed once upstream.
+
+        Parameters
+        ----------
+        R : Tensor
+            Row representations of shape (B, T, D), training samples first.
+            Unlike :meth:`_icl_predictions`, this method does not modify ``R``.
+
+        y_train : Tensor
+            Training targets of shape (B, train_size).
+
+        symmetric : bool, default=True
+            If True, return embeddings for both training and test samples, all
+            computed as queries. If False, only test samples are embedded, which
+            reproduces the asymmetric setting (:math:`q_D \\neq k_D`) at lower cost.
+
+        Returns
+        -------
+        E_train : Tensor or None
+            Training embeddings of shape (B, train_size, D), or None when
+            ``symmetric=False``.
+
+        E_test : Tensor
+            Test embeddings of shape (B, T - train_size, D).
+        """
+
+        train_size = y_train.shape[1]
+        assert train_size <= R.shape[1], "Number of training samples exceeds total samples"
+
+        if self.max_classes > 0:  # Classification
+            Ry_train = self.y_encoder(y_train.float())
+        else:  # Regression
+            Ry_train = self.y_encoder(y_train.unsqueeze(-1))
+
+        context = R[:, :train_size] + Ry_train
+        queries = R if symmetric else R[:, train_size:]
+        src = torch.cat([context, queries], dim=1)
+
+        out = self.tf_icl(src, train_size=train_size)[:, train_size:]
+        if self.norm_first:
+            out = self.ln(out)
+
+        if not symmetric:
+            return None, out
+
+        return out[:, :train_size], out[:, train_size:]
+
     def _predict_standard(
         self,
         R: Tensor,
