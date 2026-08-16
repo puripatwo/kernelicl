@@ -293,6 +293,11 @@ class TabICL(nn.Module):
         # KV cache for efficient inference
         self._cache: Optional[TabICLCache] = None
 
+        # Optional KernelICL head. Left unset so that a pretrained checkpoint
+        # still loads with strict=True; assign it after loading, e.g.
+        # ``model.kernel_head = KernelHead(d_model=icl_dim)``.
+        self.kernel_head: Optional[nn.Module] = None
+
     @property
     def has_cache(self) -> bool:
         """Check if a valid cache is stored."""
@@ -520,6 +525,106 @@ class TabICL(nn.Module):
             )
 
         return out
+
+    def forward_kernel(
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        kernel_head: Optional[nn.Module] = None,
+        num_classes: Optional[int] = None,
+        gamma: Optional[Union[float, int]] = None,
+        query_chunk_size: Optional[int] = None,
+        embed_with_test: bool = False,
+        inference_config: Optional[InferenceConfig] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """KernelICL forward pass: predict as a weighted average of training labels.
+
+        Runs column-wise embedding and row-wise interaction exactly as the standard
+        forward does, then replaces the in-context learning decoder with symmetric
+        embeddings plus an explicit kernel, so that each prediction comes with the
+        weights that produced it.
+
+        Parameters
+        ----------
+        X : Tensor
+            Input tensor of shape (B, T, H), training samples first.
+
+        y_train : Tensor
+            Training targets of shape (B, train_size).
+
+        kernel_head : Optional[nn.Module], default=None
+            The kernel head to use. Falls back to ``self.kernel_head``.
+
+        num_classes : Optional[int], default=None
+            Number of classes. Inferred from ``y_train`` when omitted. Ignored for
+            regression (``max_classes=0``).
+
+        gamma : Optional[float or int], default=None
+            Overrides the head's kernel scale, for cross-validating it without
+            rebuilding the head.
+
+        query_chunk_size : Optional[int], default=None
+            Process queries in chunks of this size to bound peak memory. See
+            :meth:`~tabicl._model.learning.ICLearning.embed`. Inference only.
+
+        embed_with_test : bool, default=False
+            If True, allow training samples to attend to test samples during
+            column-wise embedding.
+
+        inference_config : Optional[InferenceConfig], default=None
+            Inference configuration. Used only in eval mode.
+
+        Returns
+        -------
+        pred : Tensor
+            Class probabilities of shape (B, test_size, num_classes), or numeric
+            predictions of shape (B, test_size) for regression. These are already
+            normalized probabilities, not logits.
+
+        w : Tensor
+            Kernel weights of shape (B, test_size, train_size). ``w[b, j, i]`` is
+            the contribution of training sample ``i`` to test prediction ``j``.
+
+        Raises
+        ------
+        ValueError
+            If no kernel head is available.
+        """
+
+        head = kernel_head if kernel_head is not None else self.kernel_head
+        if head is None:
+            raise ValueError(
+                "No kernel head available. Pass kernel_head=... or assign model.kernel_head "
+                "before calling forward_kernel."
+            )
+
+        if self.training:
+            representations = self.row_interactor(
+                self.col_embedder(X, y_train=y_train, embed_with_test=embed_with_test)
+            )
+        else:
+            if inference_config is None:
+                inference_config = InferenceConfig()
+            representations = self.row_interactor(
+                self.col_embedder(
+                    X,
+                    y_train=y_train,
+                    embed_with_test=embed_with_test,
+                    mgr_config=inference_config.COL_CONFIG,
+                ),
+                mgr_config=inference_config.ROW_CONFIG,
+            )
+
+        E_train, E_test = self.icl_predictor.embed(
+            representations, y_train, symmetric=True, query_chunk_size=query_chunk_size
+        )
+
+        if self.max_classes == 0:
+            num_classes = None
+        elif num_classes is None:
+            num_classes = len(torch.unique(y_train[0]))
+
+        return head(E_train, E_test, y_train, num_classes=num_classes, gamma=gamma)
 
     def predict_stats(
         self,

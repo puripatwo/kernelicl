@@ -276,7 +276,13 @@ class ICLearning(nn.Module):
 
         return out
 
-    def embed(self, R: Tensor, y_train: Tensor, symmetric: bool = True) -> tuple[Optional[Tensor], Tensor]:
+    def embed(
+        self,
+        R: Tensor,
+        y_train: Tensor,
+        symmetric: bool = True,
+        query_chunk_size: Optional[int] = None,
+    ) -> tuple[Optional[Tensor], Tensor]:
         """In-context embeddings for kernel regression, skipping the MLP decoder.
 
         This is the embedding function :math:`h_D` of KernelICL: it runs the ICL
@@ -321,6 +327,19 @@ class ICLearning(nn.Module):
             computed as queries. If False, only test samples are embedded, which
             reproduces the asymmetric setting (:math:`q_D \\neq k_D`) at lower cost.
 
+        query_chunk_size : Optional[int], default=None
+            If given, process queries in chunks of this many samples, caching the
+            context K/V projections once and reusing them across chunks. Peak
+            memory then scales with the chunk size rather than with the number of
+            queries, which matters because symmetric mode issues
+            ``2 * train_size + test_size`` queries.
+
+            This is exact, not an approximation: the ICL transformer uses no
+            positional encoding, and its scalable-softmax scaling is derived from
+            the number of keys (unchanged by chunking), so each query's output
+            depends only on itself and the context. Chunking is inference-only —
+            the cached path does not build a graph for the context pass.
+
         Returns
         -------
         E_train : Tensor or None
@@ -341,9 +360,13 @@ class ICLearning(nn.Module):
 
         context = R[:, :train_size] + Ry_train
         queries = R if symmetric else R[:, train_size:]
-        src = torch.cat([context, queries], dim=1)
 
-        out = self.tf_icl(src, train_size=train_size)[:, train_size:]
+        if query_chunk_size is None:
+            src = torch.cat([context, queries], dim=1)
+            out = self.tf_icl(src, train_size=train_size)[:, train_size:]
+        else:
+            out = self._embed_chunked(context, queries, train_size, query_chunk_size)
+
         if self.norm_first:
             out = self.ln(out)
 
@@ -351,6 +374,28 @@ class ICLearning(nn.Module):
             return None, out
 
         return out[:, :train_size], out[:, train_size:]
+
+    def _embed_chunked(self, context: Tensor, queries: Tensor, train_size: int, chunk_size: int) -> Tensor:
+        """Run the ICL transformer over queries in chunks against a cached context."""
+
+        if chunk_size <= 0:
+            raise ValueError(f"query_chunk_size must be positive, got {chunk_size}")
+
+        icl_cache = KVCache()
+        # The context pass exists to populate the cache; its outputs are discarded.
+        self.tf_icl.forward_with_cache(context, icl_cache=icl_cache, train_size=train_size, store_cache=True)
+
+        chunks = [
+            self.tf_icl.forward_with_cache(
+                queries[:, start : start + chunk_size],
+                icl_cache=icl_cache,
+                use_cache=True,
+                store_cache=False,
+            )
+            for start in range(0, queries.shape[1], chunk_size)
+        ]
+
+        return torch.cat(chunks, dim=1)
 
     def _predict_standard(
         self,

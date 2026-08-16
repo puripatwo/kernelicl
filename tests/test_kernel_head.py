@@ -5,6 +5,7 @@ import torch
 
 from src.tabicl._model.kernel_head import KernelHead, relative_perplexity, squared_distances
 from src.tabicl._model.learning import ICLearning
+from src.tabicl._model.tabicl import TabICL
 
 D_MODEL = 32
 N_TRAIN = 16
@@ -135,6 +136,43 @@ def test_embeddings_depend_on_context_labels():
     assert not torch.allclose(E_test, E_test_shuffled, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("chunk_size", [1, 4, 7, N_TRAIN + N_TEST, 10_000])
+@torch.no_grad()
+def test_chunked_queries_are_exact(chunk_size):
+    """Chunking bounds peak memory and must not change a single number: the ICL
+    transformer has no positional encoding and scales its softmax by the key
+    count, so each query is independent of the others."""
+
+    icl = make_icl()
+    R, y_train = make_batch()
+
+    E_train, E_test = icl.embed(R, y_train, symmetric=True)
+    E_train_c, E_test_c = icl.embed(R, y_train, symmetric=True, query_chunk_size=chunk_size)
+
+    torch.testing.assert_close(E_train, E_train_c, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(E_test, E_test_c, rtol=1e-4, atol=1e-5)
+
+
+@torch.no_grad()
+def test_chunked_queries_are_exact_asymmetric():
+    icl = make_icl()
+    R, y_train = make_batch()
+
+    _, E_test = icl.embed(R, y_train, symmetric=False)
+    _, E_test_c = icl.embed(R, y_train, symmetric=False, query_chunk_size=2)
+
+    torch.testing.assert_close(E_test, E_test_c, rtol=1e-4, atol=1e-5)
+
+
+@torch.no_grad()
+def test_chunk_size_must_be_positive():
+    icl = make_icl()
+    R, y_train = make_batch()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        icl.embed(R, y_train, query_chunk_size=0)
+
+
 @torch.no_grad()
 def test_embed_supports_regression():
     icl = make_icl(max_classes=0)
@@ -256,6 +294,96 @@ def test_projecting_once_matches_projecting_per_call():
     cached = head.weights(head.embed(E_train), head.embed(E_test), already_projected=True)
 
     torch.testing.assert_close(direct, cached)
+
+
+# --------------------------------------------------------------------------- #
+# TabICL.forward_kernel
+# --------------------------------------------------------------------------- #
+
+
+def make_tabicl(max_classes=MAX_CLASSES, embed_dim=16, row_num_cls=2, seed=0):
+    torch.manual_seed(seed)
+    model = TabICL(
+        max_classes=max_classes,
+        embed_dim=embed_dim,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=row_num_cls,
+        icl_num_blocks=2,
+        icl_nhead=2,
+        zero_init=False,
+    )
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def test_forward_kernel_end_to_end():
+    model = make_tabicl()
+    model.kernel_head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+
+    probs, w = model.forward_kernel(X, y_train)
+
+    assert probs.shape == (1, N_TEST, 3)
+    assert w.shape == (1, N_TEST, N_TRAIN)
+    torch.testing.assert_close(w.sum(-1), torch.ones(1, N_TEST))
+
+
+@torch.no_grad()
+def test_forward_kernel_requires_a_head():
+    model = make_tabicl()
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+
+    with pytest.raises(ValueError, match="No kernel head"):
+        model.forward_kernel(X, y_train)
+
+
+@torch.no_grad()
+def test_forward_kernel_chunking_is_exact():
+    model = make_tabicl()
+    head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+
+    probs, w = model.forward_kernel(X, y_train, kernel_head=head)
+    probs_c, w_c = model.forward_kernel(X, y_train, kernel_head=head, query_chunk_size=3)
+
+    torch.testing.assert_close(probs, probs_c, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(w, w_c, rtol=1e-4, atol=1e-5)
+
+
+@torch.no_grad()
+def test_assigning_a_head_does_not_break_checkpoint_loading():
+    """The head must not be part of the constructor, or `load_state_dict` on a
+    pretrained TabICL checkpoint would fail on the head's missing keys."""
+
+    pretrained = make_tabicl().state_dict()
+    assert not any(k.startswith("kernel_head") for k in pretrained)
+
+    model = make_tabicl(seed=1)
+    model.load_state_dict(pretrained)  # strict=True
+    model.kernel_head = KernelHead(d_model=16 * 2, d_k=16 * 2)
+
+    assert any(k.startswith("kernel_head") for k in model.state_dict())
+
+
+@torch.no_grad()
+def test_forward_kernel_regression():
+    model = make_tabicl(max_classes=0)
+    model.kernel_head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randn(1, N_TRAIN)
+
+    pred, w = model.forward_kernel(X, y_train)
+
+    assert pred.shape == (1, N_TEST)
+    assert w.shape == (1, N_TEST, N_TRAIN)
 
 
 # --------------------------------------------------------------------------- #
