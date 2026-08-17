@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +26,7 @@ from torch import nn
 from tabicl._model.kernel_head import KernelHead, relative_perplexity
 from tabicl._model.tabicl import TabICL
 
-__all__ = ["FinetuneConfig", "PRESETS", "benchmark_prior", "finetune",
-           "load_finetuned", "smoke_test"]
+__all__ = ["FinetuneConfig", "PRESETS", "finetune", "load_finetuned", "smoke_test"]
 
 
 # --------------------------------------------------------------------------- #
@@ -62,22 +61,13 @@ class FinetuneConfig:
     max_seq_len: int = 1024
     min_train_size: float = 0.6
     max_train_size: float = 0.8
-    prior_threads: int = 0
-    """Background threads generating synthetic batches; 0 picks a conservative default
-    from the CPU count. More is not better: producer threads hold the GIL to build
-    each dataset, and the main thread needs it to dispatch CUDA kernels, so too many
-    can starve the GPU and end up slower than generating inline. The log reports the
-    share of each step spent waiting on data -- tune from that, or from
-    benchmark_prior(). 1 reproduces plain inline generation."""
+    prior_n_jobs: int = -1
 
     # Optimisation.
     steps: int = 5000
-    micro_batch: int = 0
+    micro_batch: int = 8
     """Datasets per forward pass; gradients accumulate to reach batch_size, so peak
-    memory tracks this rather than the effective batch. 0 probes the largest that fits
-    on this GPU. Chunking smaller than necessary is expensive: each micro-batch is a
-    separate forward and backward, and at these tensor sizes the GPU is latency-bound,
-    so eight small passes cost far more than one large one."""
+    memory tracks this rather than the effective batch."""
     lr_backbone: float = 1e-5
     lr_head: float = 1e-3
     """Separate rates: the backbone is pretrained and needs nudging, the head starts
@@ -88,10 +78,9 @@ class FinetuneConfig:
 
     # Memory.
     amp: bool = True
-    recompute: Optional[bool] = None
-    """Gradient checkpointing: trades ~20% extra compute for much less activation
-    memory. None enables it only if the smallest micro-batch would not otherwise fit,
-    so a large GPU never pays for it."""
+    recompute: bool = False
+    """Gradient checkpointing. The first dial to turn on OOM: symmetric mode runs
+    2n+m query positions through the ICL transformer and keeps them all for backward."""
 
     # Validation and output.
     val_batches: int = 32
@@ -107,23 +96,15 @@ class FinetuneConfig:
     log_every: int = 25
 
 
-V1_CHECKPOINT = "tabicl-classifier-v1-20250208.ckpt"
 V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 
-# Coherent pairings: the prior has to match what the checkpoint was pretrained on.
-# Everything else here defaults to v2, matching TabICLClassifier, so V2 keeps the
-# whole toolkit on one lineage; V1 reproduces the paper.
-V1 = {"checkpoint": V1_CHECKPOINT, "prior_type": "mlp_scm"}
-V2 = {"checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"}
-
-# Presets describe how much training to do, not how to chunk it: micro_batch and
-# recompute are probed against the actual GPU, so the same preset adapts to the card.
 PRESETS = {
     "paper": FinetuneConfig(),
-    "medium": FinetuneConfig(steps=2000, max_seq_len=768, max_features=60,
-                             val_batches=8, val_every=200),
-    "small": FinetuneConfig(steps=500, batch_size=16, max_seq_len=512, max_features=40,
-                            val_batches=4, val_every=100, warmup_steps=50),
+    "medium": FinetuneConfig(steps=2000, micro_batch=4, max_seq_len=768, max_features=60,
+                             val_batches=8, val_every=200, recompute=True),
+    "small": FinetuneConfig(steps=500, batch_size=16, micro_batch=2, max_seq_len=512,
+                            max_features=40, val_batches=4, val_every=100,
+                            warmup_steps=50, recompute=True),
 }
 
 
@@ -186,57 +167,6 @@ def _save_checkpoint(path: str, model, head, model_config: dict, d_model: int,
         "finetune_config": cfg.__dict__,
     }, temporary)
     os.replace(temporary, destination)
-
-
-def autotune_chunking(cfg, model, head, device, num_classes) -> tuple[int, bool]:
-    """Largest micro-batch that fits, and whether checkpointing is needed for it.
-
-    Probed with real forward and backward passes at the worst case the prior can
-    produce -- longest sequence, most features -- rather than estimated. Guessing this
-    is how a run ends up eight times slower than it needs to be: the tensors here are
-    small enough that the GPU is latency-bound, so unnecessary accumulation multiplies
-    per-pass overhead with nothing to show for it.
-    """
-    if cfg.micro_batch and cfg.recompute is not None:
-        return cfg.micro_batch, cfg.recompute
-
-    on_cuda = device == "cuda"
-    train_size = max(int(cfg.max_seq_len * cfg.max_train_size), 1)
-    # Off GPU there is no memory wall to find, so probe a small ceiling: the point is
-    # only to exercise the same path, cheaply.
-    ceiling = cfg.batch_size if on_cuda else min(2, cfg.batch_size)
-    candidates = ([cfg.micro_batch] if cfg.micro_batch
-                  else [b for b in (64, 32, 16, 8, 4, 2, 1) if b <= ceiling])
-
-    def fits(size: int, recompute: bool) -> bool:
-        set_recompute(model, recompute)
-        try:
-            X = torch.randn(size, cfg.max_seq_len, cfg.max_features, device=device)
-            y = torch.randint(0, max(num_classes, 2), (size, train_size),
-                              device=device).float()
-            with torch.autocast(device_type=device, enabled=cfg.amp and on_cuda):
-                probs, _ = model.forward_kernel(X, y, kernel_head=head,
-                                                num_classes=num_classes, gamma=cfg.gamma)
-                targets = y[:, :1].expand(size, probs.shape[1]).reshape(size, -1)
-                loss, used = kernel_loss(probs, targets)
-            if loss is not None and used:
-                loss.backward()
-            return True
-        except RuntimeError as exc:
-            if "out of memory" not in str(exc).lower():
-                raise
-            return False
-        finally:
-            model.zero_grad(set_to_none=True)
-            head.zero_grad(set_to_none=True)
-            if on_cuda:
-                torch.cuda.empty_cache()
-
-    for recompute in ((False, True) if cfg.recompute is None else (bool(cfg.recompute),)):
-        for size in candidates:
-            if fits(size, recompute):
-                return size, recompute
-    return 1, True
 
 
 def trainable_parameters(model: TabICL, head: nn.Module) -> tuple[list, list]:
@@ -316,98 +246,39 @@ def _forward_batch(model, head, batch, cfg, device, num_classes):
     return loss, n_used, accuracy, perplexity
 
 
-def _build_prior(cfg):
-    """One prior dataset. ``n_jobs=1``: its own process pool cannot be used here.
+def _make_prior(cfg):
+    """A prior dataset, with the worker count probed rather than assumed.
 
-    ``PriorDataset`` dispatches datasets within a batch through
-    ``multiprocessing.Pool.map``, which must pickle the sampled hyperparameters. Those
-    values are closures returned by ``HpSampler``, so the pool dies with an
-    ``AttributeError`` about a local object. Parallelism comes from threads instead --
-    see :class:`_BatchPrefetcher`.
+    Some hyperparameter samplers build unpicklable closures, and the failure
+    surfaces from inside a worker pool. Probing turns that into a setup warning.
     """
     from tabicl.prior import PriorDataset
 
-    return PriorDataset(
-        regression=False,
-        prior_type=cfg.prior_type,
-        batch_size=cfg.micro_batch,
-        min_features=cfg.min_features,
-        max_features=cfg.max_features,
-        max_seq_len=cfg.max_seq_len,
-        min_train_size=cfg.min_train_size,
-        max_train_size=cfg.max_train_size,
-        n_jobs=1,
-        device="cpu",
-    )
+    def build(n_jobs):
+        return PriorDataset(
+            regression=False,
+            prior_type=cfg.prior_type,
+            batch_size=cfg.micro_batch,
+            min_features=cfg.min_features,
+            max_features=cfg.max_features,
+            max_seq_len=cfg.max_seq_len,
+            min_train_size=cfg.min_train_size,
+            max_train_size=cfg.max_train_size,
+            n_jobs=n_jobs,
+            device="cpu",
+        )
 
+    if cfg.prior_n_jobs in (0, 1):
+        return build(1)
 
-class _BatchPrefetcher:
-    """Generates prior batches on background threads, overlapping them with training.
-
-    Synthetic data is built on the CPU while the GPU trains, so generation throughput
-    sets the floor on step time. At Appendix A settings one batch of 8 datasets takes
-    about 0.7s single-threaded, which is ~6s of generation per step and over eight
-    hours across 5000 steps -- with the GPU idle for nearly all of it.
-
-    Threads rather than processes, because the prior's hyperparameters are closures
-    that ``multiprocessing`` cannot pickle. Most of the work is numpy and torch, which
-    release the GIL, so threading still recovers roughly 4x with 8 threads.
-
-    Each thread owns its own ``PriorDataset``: ``HpSampler`` stores sampled
-    hyperparameters on the instance with ``setattr``, so sharing one across threads
-    would race.
-    """
-
-    def __init__(self, cfg, n_threads: int):
-        import queue
-        import threading
-
-        # Each producer runs torch CPU ops, and torch defaults to one intra-op thread
-        # per core, so N producers would ask for N x cores of them. The prior's own
-        # process pool sets this to 1 in its workers for the same reason. Restored in
-        # close(); the main thread is on the GPU, so its CPU intra-op count is moot.
-        self._torch_threads = torch.get_num_threads()
-        torch.set_num_threads(1)
-
-        self._queue = queue.Queue(maxsize=max(2 * n_threads, 4))
-        self._stop = threading.Event()
-        self._error = None
-        self._queue_module = queue
-        self._threads = [
-            threading.Thread(target=self._work, args=(_build_prior(cfg),), daemon=True)
-            for _ in range(n_threads)
-        ]
-        for thread in self._threads:
-            thread.start()
-
-    def _work(self, prior):
-        while not self._stop.is_set():
-            try:
-                batch = prior.get_batch()
-            except BaseException as exc:  # surface it on the consumer's next call
-                self._error = exc
-                self._stop.set()
-                return
-            while not self._stop.is_set():
-                try:
-                    self._queue.put(batch, timeout=0.5)
-                    break
-                except self._queue_module.Full:
-                    continue
-
-    def get_batch(self):
-        while True:
-            try:
-                return self._queue.get(timeout=1.0)
-            except self._queue_module.Empty:
-                if self._error is not None:
-                    raise RuntimeError("prior generation failed") from self._error
-                if not any(t.is_alive() for t in self._threads):
-                    raise RuntimeError("all prior generation threads have stopped")
-
-    def close(self):
-        self._stop.set()
-        torch.set_num_threads(self._torch_threads)
+    prior = build(cfg.prior_n_jobs)
+    try:
+        prior.get_batch()
+        return prior
+    except Exception as exc:
+        print(f"! parallel prior generation failed ({type(exc).__name__}: {str(exc)[:80]}); "
+              f"falling back to one worker. Generation may now bottleneck the GPU.")
+        return build(1)
 
 
 @torch.no_grad()
@@ -461,14 +332,8 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     if head_state is not None:
         head.load_state_dict(head_state)
     model.kernel_head = head
-    model.train()
-
-    micro_batch, recompute = autotune_chunking(cfg, model, head, device, num_classes)
-    if (micro_batch, recompute) != (cfg.micro_batch, cfg.recompute):
-        print(f"chunking probed on this device: micro_batch={micro_batch}, "
-              f"recompute={recompute}")
-    cfg = replace(cfg, micro_batch=micro_batch, recompute=recompute)
     set_recompute(model, cfg.recompute)
+    model.train()
 
     backbone_params, head_params = trainable_parameters(model, head)
     optimizer = torch.optim.AdamW(
@@ -488,12 +353,8 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     amp_dtype = torch.bfloat16 if amp_on and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on and amp_dtype is torch.float16)
 
-    # Conservative by default: past a handful of producers the GIL contention with
-    # the main thread's CUDA dispatch outweighs the extra generation throughput.
-    n_threads = cfg.prior_threads or max(1, min(4, (os.cpu_count() or 2) // 2))
-    prior = _BatchPrefetcher(cfg, n_threads)
-    print(f"generating {cfg.val_batches} validation batches "
-          f"on {n_threads} thread{'s' if n_threads > 1 else ''}...")
+    prior = _make_prior(cfg)
+    print(f"generating {cfg.val_batches} validation batches...")
     val_batches = [prior.get_batch() for _ in range(cfg.val_batches)]
 
     accum = max(cfg.batch_size // cfg.micro_batch, 1)
@@ -504,70 +365,56 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
           f"= effective batch {accum * cfg.micro_batch}\n")
 
     history = {"step": [], "loss": [], "val": []}
-    params = backbone_params + head_params
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
 
-    try:
-        for step in range(cfg.steps):
-            optimizer.zero_grad(set_to_none=True)
-            totals = np.zeros(3)  # loss, accuracy, perplexity
-            n_micro = 0
-            wait_seconds = 0.0
-            step_started = time.perf_counter()
+    for step in range(cfg.steps):
+        optimizer.zero_grad(set_to_none=True)
+        totals = np.zeros(3)  # loss, accuracy, perplexity
+        n_micro = 0
 
-            for _ in range(accum):
-                waiting = time.perf_counter()
-                batch = prior.get_batch()
-                wait_seconds += time.perf_counter() - waiting
-                with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
-                    loss, _n_used, accuracy, perplexity = _forward_batch(
-                        model, head, batch, cfg, device, num_classes)
-                if loss is None:
-                    continue
-                scaler.scale(loss / accum).backward()
-                totals += (loss.item(), accuracy, perplexity)
-                n_micro += 1
-
-            if n_micro == 0:
+        for _ in range(accum):
+            batch = prior.get_batch()
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
+                loss, _n_used, accuracy, perplexity = _forward_batch(
+                    model, head, batch, cfg, device, num_classes)
+            if loss is None:
                 continue
+            scaler.scale(loss / accum).backward()
+            totals += (loss.item(), accuracy, perplexity)
+            n_micro += 1
 
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+        if n_micro == 0:
+            continue
 
-            mean_loss, mean_acc, mean_ppl = totals / n_micro
-            history["step"].append(step)
-            history["loss"].append(mean_loss)
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(backbone_params + head_params, cfg.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
 
-            step_seconds = time.perf_counter() - step_started
-            if step % cfg.log_every == 0 or step == cfg.steps - 1:
-                rate = (step + 1) / (time.perf_counter() - started)
-                # "wait" is the share of the step spent blocked on synthetic data. High
-                # means data-bound: raise prior_threads. Near zero means the GPU is the
-                # limit and more threads will only take the GIL from CUDA dispatch.
-                print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
-                      f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
-                      f"{rate:.2f} step/s  wait {100 * wait_seconds / max(step_seconds, 1e-9):.0f}%")
+        mean_loss, mean_acc, mean_ppl = totals / n_micro
+        history["step"].append(step)
+        history["loss"].append(mean_loss)
 
-            if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
-                metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
-                history["val"].append({"step": step, **metrics})
-                improved = metrics["loss"] < best_val
-                if improved:
-                    best_val = metrics["loss"]
-                    _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
-                                     cfg, best_val)
-                    saved_any = True
-                print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
-                      f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
-                      f"{'  <- best, saved' if improved else ''}")
+        if step % cfg.log_every == 0 or step == cfg.steps - 1:
+            rate = (step + 1) / (time.perf_counter() - started)
+            print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
+                  f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
+                  f"{rate:.2f} step/s")
 
-    finally:
-        # Background generation threads must not outlive the run.
-        prior.close()
+        if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
+            metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
+            history["val"].append({"step": step, **metrics})
+            improved = metrics["loss"] < best_val
+            if improved:
+                best_val = metrics["loss"]
+                _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
+                                 cfg, best_val)
+                saved_any = True
+            print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
+                  f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
+                  f"{'  <- best, saved' if improved else ''}")
 
     if not saved_any:
         print("\nno validation checkpoint was taken; nothing saved")
@@ -592,39 +439,6 @@ def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, Ker
     return model.to(device).eval(), head.to(device).eval()
 
 
-def benchmark_prior(cfg: Optional[FinetuneConfig] = None, preset: str = "paper",
-                    thread_counts=(1, 2, 4, 8), batches: int = 6) -> dict:
-    """Measure generation throughput at several thread counts, on this machine.
-
-    Generation speed depends on core count, and the best thread count is not the
-    largest -- producers hold the GIL that the main thread needs to dispatch CUDA
-    work. This measures generation alone, so treat the winner as an upper bound and
-    confirm with the ``wait`` percentage in the training log.
-    """
-    cfg = cfg or PRESETS[preset]
-    print(f"cpu_count={os.cpu_count()}  micro_batch={cfg.micro_batch}  "
-          f"max_seq_len={cfg.max_seq_len}  max_features={cfg.max_features}\n")
-    print(f"{'threads':>8} {'s/batch':>9} {'s/step':>8}   {'5000 steps':>11}")
-    results = {}
-    accum = max(cfg.batch_size // cfg.micro_batch, 1)
-    for n in thread_counts:
-        prefetcher = _BatchPrefetcher(cfg, n)
-        try:
-            prefetcher.get_batch()
-            begun = time.perf_counter()
-            for _ in range(batches):
-                prefetcher.get_batch()
-            per_batch = (time.perf_counter() - begun) / batches
-        finally:
-            prefetcher.close()
-        results[n] = per_batch
-        print(f"{n:>8} {per_batch:>9.2f} {per_batch * accum:>8.1f}   "
-              f"{per_batch * accum * cfg.steps / 3600:>10.1f}h")
-    best = min(results, key=results.get)
-    print(f"\nfastest at prior_threads={best}; the training log's wait% is the real test")
-    return results
-
-
 def smoke_test(device: Optional[str] = None) -> None:
     """Two optimiser steps on tiny batches, on the GPU if there is one.
 
@@ -634,7 +448,7 @@ def smoke_test(device: Optional[str] = None) -> None:
     cfg = FinetuneConfig(
         steps=2, batch_size=2, micro_batch=1, max_seq_len=128, max_features=8,
         min_features=4, val_batches=1, val_every=1, warmup_steps=1, log_every=1,
-        amp=False, prior_threads=1, device=device, out_path="/tmp/kicl_smoke.pt",
+        amp=False, prior_n_jobs=1, device=device, out_path="/tmp/kicl_smoke.pt",
     )
     history = finetune(cfg)
     assert history["loss"], "no optimiser step completed"
@@ -670,13 +484,10 @@ def smoke_test(device: Optional[str] = None) -> None:
 # history = finetune(preset="small")        # T4 / 16 GB    ~30 min
 # history = finetune(preset="medium")       # 24 GB         a few hours
 #
-# # Lineage. The default here is v1 + mlp_scm, which is Appendix A. Every other file
-# # defaults to v2, so if you want one lineage throughout, use V2 -- and then leave
-# # CHECKPOINT = None in the analysis files, which is already v2.
-# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__, **V2})
-#
-# # Staying on v1 instead means telling the analysis files so their stock-TabICL
-# # baselines match: set CHECKPOINT = V1_CHECKPOINT there.
+# # To start from TabICLv2, switch the prior with it -- everything else (d_model,
+# # class count, module paths) is read from the checkpoint:
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
+#                         "checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"})
 #
 # # Watch the [val] lines, not the step lines: every step draws a fresh random
 # # synthetic problem, so train loss reflects that draw rather than progress.

@@ -19,18 +19,12 @@ import torch
 from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import KernelHead, relative_perplexity, squared_distances
 
-__all__ = ["ClinicalExplainer", "fit_explainer", "as_array", "standardized_numeric",
-           "V1_CHECKPOINT", "V2_CHECKPOINT"]
+__all__ = ["ClinicalExplainer", "fit_explainer"]
 
 # Wider at the top end than the paper's Table 7: an untrained projection leaves the
 # embeddings on a scale where the useful region sits higher.
 GAMMA_GRID = [0.01, 0.05, 0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0]
 K_GRID = [1, 4, 5, 16, 32, 64, 128, 256, 512, 1024]
-
-# TabICLClassifier defaults to v2, so every file here does too unless told otherwise.
-# v1 is what the KernelICL paper built on.
-V1_CHECKPOINT = "tabicl-classifier-v1-20250208.ckpt"
-V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 
 
 # --------------------------------------------------------------------------- #
@@ -40,28 +34,8 @@ def _bar(share: float, width: int = 12) -> str:
     return ("█" * int(round(share * width))).ljust(width, "·")
 
 
-def as_array(a) -> np.ndarray:
-    """A flat numpy array. Series are coerced because weights index rows positionally,
-    and a non-default index would silently turn that into a label lookup."""
+def _as_array(a) -> np.ndarray:
     return (a.to_numpy() if hasattr(a, "to_numpy") else np.asarray(a)).ravel()
-
-
-def standardized_numeric(clf, X_train, X_test):
-    """Both matrices through TabICL's numeric encoder, median-imputed and z-scored.
-
-    The input-space baselines need a numeric, NaN-free matrix, which raw X may not be.
-    Reusing the model's own encoder maps string and categorical columns the way the
-    model sees them. Imputation is for sklearn's benefit: TabICL handles NaN, its
-    neighbour baselines do not.
-    """
-    train = np.asarray(clf.X_encoder_.transform(X_train), dtype=float)
-    test = np.asarray(clf.X_encoder_.transform(X_test), dtype=float)
-    median = np.nan_to_num(np.nanmedian(train, axis=0))
-    train = np.where(np.isnan(train), median, train)
-    test = np.where(np.isnan(test), median, test)
-    mean, sd = train.mean(0), train.std(0)
-    sd = np.where(sd == 0, 1.0, sd)
-    return (train - mean) / sd, (test - mean) / sd
 
 
 def _take(X, idx):
@@ -110,13 +84,11 @@ def _make_folds(y, n_folds: int, val_size: float, random_state: int):
                              random_state=random_state, stratify=strat)]
 
 
-def _make_clf(device, norm_method: str, random_state: int,
-              checkpoint_version: Optional[str] = None) -> TabICLClassifier:
+def _make_clf(device, norm_method: str, random_state: int) -> TabICLClassifier:
     """One ensemble member, no shuffling, so a weight index is a training row.
 
     TabICL averages 8 members by default; averaging destroys per-case attribution.
     """
-    extra = {"checkpoint_version": checkpoint_version} if checkpoint_version else {}
     return TabICLClassifier(
         n_estimators=1,
         norm_methods=[norm_method],
@@ -125,7 +97,6 @@ def _make_clf(device, norm_method: str, random_state: int,
         device=device,
         random_state=random_state,
         kv_cache=False,
-        **extra,
     )
 
 
@@ -169,7 +140,6 @@ def fit_explainer(
     feature_names: Optional[Sequence] = None,
     device: Optional[str] = None,
     norm_method: str = "none",
-    checkpoint_version: Optional[str] = None,
     finetuned: Optional[str] = None,
     calibrate: bool = True,
     n_folds: int = 5,
@@ -193,10 +163,6 @@ def fit_explainer(
         see :meth:`ClinicalExplainer.with_kernel`.
     gamma : float, optional
         Kernel scale. Calibrated on held-out data when None.
-    checkpoint_version : str, optional
-        Which pretrained TabICL to load, e.g. ``V1_CHECKPOINT``. None uses
-        TabICLClassifier's own default, currently v2. Ignored when ``finetuned`` is
-        given, since the network is then rebuilt from the checkpoint's own config.
     finetuned : str, optional
         Checkpoint from ``kernelicl_finetune.finetune()``. Swapped into every
         classifier including the calibration folds, since a scale calibrated on the
@@ -218,7 +184,7 @@ def fit_explainer(
         if verbose:
             print(msg)
 
-    y_train = as_array(y_train)
+    y_train = _as_array(y_train)
     if feature_names is None and hasattr(X_train, "columns"):
         feature_names = list(X_train.columns)
     if device is None:
@@ -229,7 +195,7 @@ def fit_explainer(
     payload = _load_finetuned(finetuned) if finetuned else None
 
     def fit_clf(X, y):
-        clf = _make_clf(device, norm_method, random_state, checkpoint_version)
+        clf = _make_clf(device, norm_method, random_state)
         clf.fit(X, y)
         return _swap_in_finetuned(clf, payload, device) if payload else clf
 
@@ -245,12 +211,6 @@ def fit_explainer(
         say(f"  fine-tuned projection {d_model}->{head_config['d_k']}, "
             f"trained with kernel={head_config['kernel']}, "
             f"validation loss {payload.get('val_loss', float('nan')):.4f}")
-        # A v1-derived model compared against a v2 baseline is not a like-for-like
-        # comparison, and the mismatch is otherwise invisible.
-        trained_from = payload.get("finetune_config", {}).get("checkpoint")
-        if trained_from and checkpoint_version and trained_from != checkpoint_version:
-            say(f"  ! fine-tuned from {trained_from} but checkpoint_version is "
-                f"{checkpoint_version}; baselines will not be like-for-like")
     else:
         d_model = clf.model_.icl_predictor.decoder[0].in_features
         head = KernelHead(d_model=d_model, d_k=d_model, kernel=kernel,
@@ -382,7 +342,7 @@ class ClinicalExplainer:
         self.top_k, self.min_agreement = top_k, min_agreement
         self.X_train, self.X_test = X_train, X_test
         self.feature_names = feature_names
-        self.y_train = as_array(y_train)
+        self.y_train = _as_array(y_train)
         self.n, self.m = E_train.shape[1], E_test.shape[1]
         self.train_ids = np.asarray(train_ids if train_ids is not None else np.arange(self.n))
         self.test_ids = np.asarray(test_ids if test_ids is not None else np.arange(self.m))
@@ -553,7 +513,7 @@ class ClinicalExplainer:
         embedding and so carries *less* weight than average, so filtering by
         influence discards exactly the records being hunted.
         """
-        y_test = as_array(y_test)
+        y_test = _as_array(y_test)
         wrong = self.pred != y_test
         columns = ["record", "stored_outcome", "error_share", "weight_on_errors",
                    "total_influence", "cases_influenced"]
@@ -599,7 +559,7 @@ class ClinicalExplainer:
         same group. A low value means predictions for that group are extrapolated
         from a different population, which can happen at equal accuracy.
         """
-        train_groups, test_groups = as_array(train_groups), as_array(test_groups)
+        train_groups, test_groups = _as_array(train_groups), _as_array(test_groups)
         if len(train_groups) != self.n or len(test_groups) != self.m:
             raise ValueError(f"expected {self.n} train and {self.m} test group labels, "
                              f"got {len(train_groups)} and {len(test_groups)}")
@@ -648,7 +608,17 @@ class ClinicalExplainer:
                              "or build the explainer with fit_explainer()")
         feature_names = feature_names if feature_names is not None else self.feature_names
 
-        Xtr_s, Xte_s = standardized_numeric(self.clf, X_train, X_test)
+        # TabICL's own encoder, so string columns map as the model sees them. NaNs
+        # are median-imputed for the sklearn baseline only.
+        Xtr = np.asarray(self.clf.X_encoder_.transform(X_train), dtype=float)
+        Xte = np.asarray(self.clf.X_encoder_.transform(X_test), dtype=float)
+        median = np.nan_to_num(np.nanmedian(Xtr, axis=0))
+        Xtr = np.where(np.isnan(Xtr), median, Xtr)
+        Xte = np.where(np.isnan(Xte), median, Xte)
+
+        mean, sd = Xtr.mean(0), Xtr.std(0)
+        sd = np.where(sd == 0, 1.0, sd)
+        Xtr_s, Xte_s = (Xtr - mean) / sd, (Xte - mean) / sd
 
         idx_model = np.argsort(-self.w, axis=1)[:, :k]
         idx_plain = NearestNeighbors(n_neighbors=k).fit(Xtr_s).kneighbors(
@@ -660,7 +630,7 @@ class ClinicalExplainer:
 
         model_c, plain_c = compactness(idx_model), compactness(idx_plain)
         names = feature_names if feature_names is not None else [
-            f"feature {i}" for i in range(Xtr_s.shape[1])]
+            f"feature {i}" for i in range(Xtr.shape[1])]
         return (pd.DataFrame({
                     "feature": [str(n) for n in names],
                     "plain_knn": plain_c,

@@ -15,11 +15,6 @@ from tabicl._model.kernel_head import KernelHead, relative_perplexity
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 KERNEL, SCALE = "knn", 5   # 5 nearest neighbours: the most legible starting point
-CHECKPOINT = None          # None = TabICL's default (v2)
-                           # "tabicl-classifier-v1-20250208.ckpt" for the paper's
-FINETUNED = None           # path to a kernelicl_finetune checkpoint, or None.
-                           # When set, CHECKPOINT is ignored: the network and the
-                           # trained projection both come from the checkpoint.
 
 # Weights are indexed positionally against training rows, so a pandas Series with a
 # non-default index would silently do label lookup and report the wrong rows.
@@ -31,8 +26,7 @@ print(f"device={DEVICE} | train {X_train.shape} | test {X_test.shape}")
 # One ensemble member and no shuffling: TabICL averages 8 by default, and averaging
 # destroys the per-case attribution this is all for.
 clf = TabICLClassifier(n_estimators=1, norm_methods=["none"], feat_shuffle_method="none",
-                       class_shuffle_method="none", device=DEVICE, random_state=0,
-                       **({"checkpoint_version": CHECKPOINT} if CHECKPOINT else {}))
+                       class_shuffle_method="none", device=DEVICE, random_state=0)
 clf.fit(X_train, y_train)
 
 # The ensemble generator sits after TabICL's numeric encoder, so encode first;
@@ -44,26 +38,9 @@ assert np.array_equal(y_ens[0], clf.y_encoder_.transform(y_train)), "row order c
 X_t = torch.from_numpy(np.asarray(X_ens)).float().to(DEVICE)
 y_t = torch.from_numpy(np.asarray(y_ens)).float().to(DEVICE)
 
-# Only the network is swapped for a fine-tuned one; the classifier is still needed
-# for its preprocessing, label encoder and inference config. Spelled out here rather
-# than imported, to keep this file standalone -- kernelicl_clinical does the same
-# thing behind fit_explainer(finetuned=...), with the kernel scale recalibrated too.
-if FINETUNED:
-    from tabicl._model.tabicl import TabICL
-
-    payload = torch.load(FINETUNED, map_location="cpu", weights_only=False)
-    model = TabICL(**payload["config"])
-    model.load_state_dict(payload["state_dict"])
-    clf.model_ = model.to(DEVICE).eval()
-    head = KernelHead(**payload["head_config"]).to(DEVICE)
-    head.load_state_dict(payload["kernel_head"])
-    head.kernel = KERNEL
-    print(f"using fine-tuned weights from {FINETUNED}")
-else:
-    d_model = clf.model_.icl_predictor.decoder[0].in_features
-    head = KernelHead(d_model=d_model, d_k=d_model, kernel=KERNEL,
-                      identity_init=True).to(DEVICE)
-clf.model_.kernel_head = head
+d_model = clf.model_.icl_predictor.decoder[0].in_features
+clf.model_.kernel_head = KernelHead(d_model=d_model, d_k=d_model, kernel=KERNEL,
+                                    identity_init=True).to(DEVICE)
 
 with torch.no_grad():
     probs, w = clf.model_.forward_kernel(X_t, y_t, gamma=SCALE,

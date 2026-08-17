@@ -19,28 +19,19 @@ from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import relative_perplexity
 
 # Works whether kernelicl_clinical.py was pasted into the session or is importable.
-# The candidates cover %run from anywhere, pasting from the repo root, and pasting
-# from this directory.
 if "fit_explainer" not in globals():
     import os
     import sys
 
-    # V1_CHECKPOINT / V2_CHECKPOINT are imported for CHECKPOINT below, not used here.
-    _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
-    for _candidate in (_here, os.getcwd(), os.path.join(os.getcwd(), "kernelicl")):
-        if _candidate and _candidate not in sys.path:
-            sys.path.insert(0, _candidate)
-    from kernelicl_clinical import (GAMMA_GRID, K_GRID, V1_CHECKPOINT, V2_CHECKPOINT,
-                                    _embed, _make_clf, _make_folds, _take, as_array,
-                                    fit_explainer, standardized_numeric)
+    if os.getcwd() not in sys.path:
+        sys.path.insert(0, os.getcwd())
+    from kernelicl_clinical import (GAMMA_GRID, K_GRID, _embed, _make_clf, _make_folds,
+                                    _take, fit_explainer)
 
 SEED = 0
 KERNELS = ("gaussian", "dot", "knn")
 COMPACTNESS_K = 5
 FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
-CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT. Ignored when
-                   # FINETUNED is set, except for the stock baselines in T2, which
-                   # should match whatever the fine-tune started from.
 
 # "accuracy" reproduces the paper, whose benchmark datasets are roughly balanced.
 # For screening it flatters the majority class. This feeds the calibration too, so it
@@ -48,7 +39,8 @@ CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT. Ignored whe
 METRIC = "balanced_accuracy"   # "accuracy" | "balanced_accuracy"
 
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
-y_train, y_test = as_array(y_train), as_array(y_test)
+y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
+y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
 
 
 def evaluate(y_true, y_pred) -> float:
@@ -113,7 +105,7 @@ def limits(v, margin=0.06):
 # Setup: embed once, reuse for every table and figure
 # --------------------------------------------------------------------------- #
 ex = fit_explainer(X_train, y_train, X_test, feature_names=FEATURE_NAMES,
-                   finetuned=FINETUNED, checkpoint_version=CHECKPOINT)
+                   finetuned=FINETUNED)
 clf, head, n_classes = ex.clf, ex.head, ex.clf.n_classes_
 DEVICE = ex.head.proj.weight.device.type
 
@@ -189,8 +181,7 @@ print("\n* = scale selected on held-out data")
 # TabICL-MLP is absent on purpose: in the paper it is the same architecture
 # fine-tuned with an MLP head, so without fine-tuning it is bit-identical to
 # TabICL (single). Reporting it would be inventing a number.
-clf_ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED,
-                                **({"checkpoint_version": CHECKPOINT} if CHECKPOINT else {}))
+clf_ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED)
 clf_ensemble.fit(X_train, y_train)
 
 started = time.perf_counter()
@@ -252,7 +243,14 @@ plt.show()
 # --------------------------------------------------------------------------- #
 # Relative perplexity is k/n for both methods, so equal k means equal
 # inspectability and the only difference is which neighbours get chosen.
-Xtr_s, Xte_s = standardized_numeric(clf, X_train, X_test)
+Xtr_num = np.asarray(clf.X_encoder_.transform(X_train), dtype=float)
+Xte_num = np.asarray(clf.X_encoder_.transform(X_test), dtype=float)
+median = np.nan_to_num(np.nanmedian(Xtr_num, axis=0))
+Xtr_num = np.where(np.isnan(Xtr_num), median, Xtr_num)
+Xte_num = np.where(np.isnan(Xte_num), median, Xte_num)
+mean, sd = Xtr_num.mean(0), Xtr_num.std(0)
+sd = np.where(sd == 0, 1.0, sd)
+Xtr_s, Xte_s = (Xtr_num - mean) / sd, (Xte_num - mean) / sd
 
 print(f"\n{'k':>6} {'rel.PPL%':>10} {'KernelICL':>11} {'plain kNN':>11} {'delta pp':>10}")
 T4 = []

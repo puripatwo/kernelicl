@@ -155,30 +155,6 @@ average record's influence cut recovery of seeded bad labels from 41/60 to 5/60.
 Ranking by error *share* rather than raw weight-on-errors doubled recovery again
 (21/30 vs 10/30, chance 2.6).
 
-**Prior generation, not the GPU, is the bottleneck.** Synthetic batches are built on
-CPU while the GPU trains. At Appendix A settings one batch of 8 datasets takes ~0.7s
-single-threaded — about 6s per step, over **8 hours** across 5000 steps, with the GPU
-idle for nearly all of it. And `PriorDataset`'s own process pool cannot be used:
-`HpSampler` returns sampled hyperparameters as *closures*, which `multiprocessing`
-cannot pickle, so the pool dies with `AttributeError: Can't get local object`.
-
-The fix is threads, not processes. Most of the work is numpy and torch, which release
-the GIL. Each thread needs its **own** `PriorDataset`, because `HpSampler` stores
-draws on the instance with `setattr`.
-
-**But more threads is not simply better, and the first version of this was too
-greedy.** Producers hold the GIL to build each dataset, and the main thread needs it
-to dispatch CUDA kernels, so past a handful of producers the GPU starves and the run
-can end up *slower* than generating inline. Producers also each ran torch CPU ops at
-torch's default intra-op thread count, asking for `threads x cores` of them; the
-prior's own process pool set that to 1 in its workers, and the prefetcher now does the
-same.
-
-Do not guess the thread count. `benchmark_prior()` measures generation alone on your
-machine, and the training log reports **`wait %`**, the share of each step spent
-blocked on data — that is the real signal. High: raise `prior_threads`. Near zero:
-you are GPU-bound and raising it only takes the GIL from CUDA dispatch.
-
 **Chunked queries do not help at typical scale.** Measured at n=11,690 / m=2,923: the
 unchunked ICL stage costs ~650 MB and chunking is *worse*, because the 12-block K/V
 cache (~570 MB) outweighs the activations it replaces. It pays off only when queries
@@ -198,25 +174,6 @@ prior, each with its own context/query split, and asks that a plain weighted ave
 of context outcomes get the queries right. Across thousands of unrelated problems that
 produces a representation where nearest-neighbour voting works in general. Your own
 data is never involved.
-
-### Which checkpoint each file uses
-
-`TabICLClassifier` defaults to **v2**, so `kernelicl_colab.py`, `kernelicl_clinical.py`,
-`kernelicl_analysis.py` and `kernelicl_embeddings.py` all use v2 unless told otherwise.
-`kernelicl_finetune.py` defaults to **v1**, because that is what the paper built on.
-
-That mismatch matters only if you compare across it — a v1-derived model against v2
-stock baselines is not like-for-like, and `fit_explainer` prints a warning when it
-detects that pairing. To stay on one lineage:
-
-| | fine-tune | analysis / embeddings |
-|---|---|---|
-| all v2 (default elsewhere) | `FinetuneConfig(**{**PRESETS["paper"].__dict__, **V2})` | `CHECKPOINT = None` |
-| all v1 (the paper) | `PRESETS["paper"]` as-is | `CHECKPOINT = V1_CHECKPOINT` |
-
-Then point the analysis files at the result with `FINETUNED = "path/to/checkpoint.pt"`.
-The fine-tuned network is rebuilt from its own stored config, so it carries its lineage
-with it; `CHECKPOINT` only controls the *pretrained baselines* it is compared against.
 
 ### Starting from TabICLv2
 
@@ -242,22 +199,11 @@ Do not copy v2's stage-2/3 recipe (`max_seq_len` 10240/60000, `seq_len_per_gp=Tr
 those are its long-context stages, and `seq_len_per_gp` returns nested tensors the
 training loop here does not handle.
 
-| preset | for |
-|---|---|
-| `paper` | Appendix A verbatim, 5000 steps × 64 datasets |
-| `medium` | a real run, shorter sequences and fewer features |
-| `small` | does the loss move at all |
-
-Presets describe how much training to do, **not how to chunk it**. `micro_batch` and
-`recompute` are probed against the actual GPU with real forward and backward passes at
-the worst case the prior can produce, so the same preset adapts to the card.
-
-That probe exists because guessing it is expensive. An early version fixed
-`micro_batch=2` and `recompute=True` in the small preset so it would fit a 16 GB card;
-on a 40 GB A100 that meant eight sequential forward/backward passes per step on two
-datasets each, with every forward recomputed for the backward. The tensors at these
-sizes are small enough that the GPU is latency-bound, so unnecessary accumulation
-multiplies per-pass overhead with nothing to show for it.
+| preset | GPU | for |
+|---|---|---|
+| `paper` | A100 / 40 GB | Appendix A verbatim, 5000 × 64 |
+| `medium` | 24 GB | a real run |
+| `small` | T4 / 16 GB | does the loss move at all |
 
 Run `smoke_test()` first — two steps on tiny batches, and it caught three real bugs
 during development.
