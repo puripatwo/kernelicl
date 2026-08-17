@@ -187,6 +187,25 @@ of context outcomes get the queries right. Across thousands of unrelated problem
 produces a representation where nearest-neighbour voting works in general. Your own
 data is never involved.
 
+### Which checkpoint each file uses
+
+`TabICLClassifier` defaults to **v2**, so `kernelicl_colab.py`, `kernelicl_clinical.py`,
+`kernelicl_analysis.py` and `kernelicl_embeddings.py` all use v2 unless told otherwise.
+`kernelicl_finetune.py` defaults to **v1**, because that is what the paper built on.
+
+That mismatch matters only if you compare across it — a v1-derived model against v2
+stock baselines is not like-for-like, and `fit_explainer` prints a warning when it
+detects that pairing. To stay on one lineage:
+
+| | fine-tune | analysis / embeddings |
+|---|---|---|
+| all v2 (default elsewhere) | `FinetuneConfig(**{**PRESETS["paper"].__dict__, **V2})` | `CHECKPOINT = None` |
+| all v1 (the paper) | `PRESETS["paper"]` as-is | `CHECKPOINT = V1_CHECKPOINT` |
+
+Then point the analysis files at the result with `FINETUNED = "path/to/checkpoint.pt"`.
+The fine-tuned network is rebuilt from its own stored config, so it carries its lineage
+with it; `CHECKPOINT` only controls the *pretrained baselines* it is compared against.
+
 ### Starting from TabICLv2
 
 `checkpoint` alone is not the whole change. `d_model` (512 in both), the class count

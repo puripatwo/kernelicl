@@ -17,17 +17,23 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
 from sklearn.neighbors import NearestNeighbors
 
+# Works whether kernelicl_clinical.py was pasted into the session or is importable.
+# The candidates cover %run from anywhere, pasting from the repo root, and pasting
+# from this directory.
 if "fit_explainer" not in globals():
     import os
     import sys
 
-    if os.getcwd() not in sys.path:
-        sys.path.insert(0, os.getcwd())
-    from kernelicl_clinical import fit_explainer
+    _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
+    for _candidate in (_here, os.getcwd(), os.path.join(os.getcwd(), "kernelicl")):
+        if _candidate and _candidate not in sys.path:
+            sys.path.insert(0, _candidate)
+    from kernelicl_clinical import V1_CHECKPOINT, V2_CHECKPOINT, fit_explainer
 
 SEED = 0
 PURITY_K = (1, 5, 10, 20, 50)
 FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
+CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT
 
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
 y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
@@ -78,7 +84,8 @@ def limits(v, margin=0.06):
 # Setup: three spaces to compare
 # --------------------------------------------------------------------------- #
 ex = fit_explainer(X_train, y_train, X_test, feature_names=FEATURE_NAMES,
-                   keep_row_repr=True, finetuned=FINETUNED)
+                   keep_row_repr=True, finetuned=FINETUNED,
+                   checkpoint_version=CHECKPOINT)
 
 with torch.no_grad():
     H_train = ex.head.embed(ex.E_train)[0].cpu().numpy().astype(np.float64)

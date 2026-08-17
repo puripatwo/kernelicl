@@ -99,7 +99,14 @@ class FinetuneConfig:
     log_every: int = 25
 
 
+V1_CHECKPOINT = "tabicl-classifier-v1-20250208.ckpt"
 V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
+
+# Coherent pairings: the prior has to match what the checkpoint was pretrained on.
+# Everything else here defaults to v2, matching TabICLClassifier, so V2 keeps the
+# whole toolkit on one lineage; V1 reproduces the paper.
+V1 = {"checkpoint": V1_CHECKPOINT, "prior_type": "mlp_scm"}
+V2 = {"checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"}
 
 PRESETS = {
     "paper": FinetuneConfig(),
@@ -552,10 +559,13 @@ def smoke_test(device: Optional[str] = None) -> None:
 # history = finetune(preset="small")        # T4 / 16 GB    ~30 min
 # history = finetune(preset="medium")       # 24 GB         a few hours
 #
-# # To start from TabICLv2, switch the prior with it -- everything else (d_model,
-# # class count, module paths) is read from the checkpoint:
-# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
-#                         "checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"})
+# # Lineage. The default here is v1 + mlp_scm, which is Appendix A. Every other file
+# # defaults to v2, so if you want one lineage throughout, use V2 -- and then leave
+# # CHECKPOINT = None in the analysis files, which is already v2.
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__, **V2})
+#
+# # Staying on v1 instead means telling the analysis files so their stock-TabICL
+# # baselines match: set CHECKPOINT = V1_CHECKPOINT there.
 #
 # # Watch the [val] lines, not the step lines: every step draws a fresh random
 # # synthetic problem, so train loss reflects that draw rather than progress.

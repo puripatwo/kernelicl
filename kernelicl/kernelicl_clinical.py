@@ -19,12 +19,17 @@ import torch
 from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import KernelHead, relative_perplexity, squared_distances
 
-__all__ = ["ClinicalExplainer", "fit_explainer"]
+__all__ = ["ClinicalExplainer", "fit_explainer", "V1_CHECKPOINT", "V2_CHECKPOINT"]
 
 # Wider at the top end than the paper's Table 7: an untrained projection leaves the
 # embeddings on a scale where the useful region sits higher.
 GAMMA_GRID = [0.01, 0.05, 0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0]
 K_GRID = [1, 4, 5, 16, 32, 64, 128, 256, 512, 1024]
+
+# TabICLClassifier defaults to v2, so every file here does too unless told otherwise.
+# v1 is what the KernelICL paper built on.
+V1_CHECKPOINT = "tabicl-classifier-v1-20250208.ckpt"
+V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 
 
 # --------------------------------------------------------------------------- #
@@ -84,11 +89,13 @@ def _make_folds(y, n_folds: int, val_size: float, random_state: int):
                              random_state=random_state, stratify=strat)]
 
 
-def _make_clf(device, norm_method: str, random_state: int) -> TabICLClassifier:
+def _make_clf(device, norm_method: str, random_state: int,
+              checkpoint_version: Optional[str] = None) -> TabICLClassifier:
     """One ensemble member, no shuffling, so a weight index is a training row.
 
     TabICL averages 8 members by default; averaging destroys per-case attribution.
     """
+    extra = {"checkpoint_version": checkpoint_version} if checkpoint_version else {}
     return TabICLClassifier(
         n_estimators=1,
         norm_methods=[norm_method],
@@ -97,6 +104,7 @@ def _make_clf(device, norm_method: str, random_state: int) -> TabICLClassifier:
         device=device,
         random_state=random_state,
         kv_cache=False,
+        **extra,
     )
 
 
@@ -140,6 +148,7 @@ def fit_explainer(
     feature_names: Optional[Sequence] = None,
     device: Optional[str] = None,
     norm_method: str = "none",
+    checkpoint_version: Optional[str] = None,
     finetuned: Optional[str] = None,
     calibrate: bool = True,
     n_folds: int = 5,
@@ -163,6 +172,10 @@ def fit_explainer(
         see :meth:`ClinicalExplainer.with_kernel`.
     gamma : float, optional
         Kernel scale. Calibrated on held-out data when None.
+    checkpoint_version : str, optional
+        Which pretrained TabICL to load, e.g. ``V1_CHECKPOINT``. None uses
+        TabICLClassifier's own default, currently v2. Ignored when ``finetuned`` is
+        given, since the network is then rebuilt from the checkpoint's own config.
     finetuned : str, optional
         Checkpoint from ``kernelicl_finetune.finetune()``. Swapped into every
         classifier including the calibration folds, since a scale calibrated on the
@@ -195,7 +208,7 @@ def fit_explainer(
     payload = _load_finetuned(finetuned) if finetuned else None
 
     def fit_clf(X, y):
-        clf = _make_clf(device, norm_method, random_state)
+        clf = _make_clf(device, norm_method, random_state, checkpoint_version)
         clf.fit(X, y)
         return _swap_in_finetuned(clf, payload, device) if payload else clf
 
@@ -211,6 +224,12 @@ def fit_explainer(
         say(f"  fine-tuned projection {d_model}->{head_config['d_k']}, "
             f"trained with kernel={head_config['kernel']}, "
             f"validation loss {payload.get('val_loss', float('nan')):.4f}")
+        # A v1-derived model compared against a v2 baseline is not a like-for-like
+        # comparison, and the mismatch is otherwise invisible.
+        trained_from = payload.get("finetune_config", {}).get("checkpoint")
+        if trained_from and checkpoint_version and trained_from != checkpoint_version:
+            say(f"  ! fine-tuned from {trained_from} but checkpoint_version is "
+                f"{checkpoint_version}; baselines will not be like-for-like")
     else:
         d_model = clf.model_.icl_predictor.decoder[0].in_features
         head = KernelHead(d_model=d_model, d_k=d_model, kernel=kernel,

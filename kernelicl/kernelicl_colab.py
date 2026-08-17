@@ -15,6 +15,8 @@ from tabicl._model.kernel_head import KernelHead, relative_perplexity
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 KERNEL, SCALE = "knn", 5   # 5 nearest neighbours: the most legible starting point
+CHECKPOINT = None          # None = TabICL's default (v2)
+                           # "tabicl-classifier-v1-20250208.ckpt" for the paper's
 
 # Weights are indexed positionally against training rows, so a pandas Series with a
 # non-default index would silently do label lookup and report the wrong rows.
@@ -26,7 +28,8 @@ print(f"device={DEVICE} | train {X_train.shape} | test {X_test.shape}")
 # One ensemble member and no shuffling: TabICL averages 8 by default, and averaging
 # destroys the per-case attribution this is all for.
 clf = TabICLClassifier(n_estimators=1, norm_methods=["none"], feat_shuffle_method="none",
-                       class_shuffle_method="none", device=DEVICE, random_state=0)
+                       class_shuffle_method="none", device=DEVICE, random_state=0,
+                       **({"checkpoint_version": CHECKPOINT} if CHECKPOINT else {}))
 clf.fit(X_train, y_train)
 
 # The ensemble generator sits after TabICL's numeric encoder, so encode first;

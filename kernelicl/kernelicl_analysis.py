@@ -19,19 +19,27 @@ from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import relative_perplexity
 
 # Works whether kernelicl_clinical.py was pasted into the session or is importable.
+# The candidates cover %run from anywhere, pasting from the repo root, and pasting
+# from this directory.
 if "fit_explainer" not in globals():
     import os
     import sys
 
-    if os.getcwd() not in sys.path:
-        sys.path.insert(0, os.getcwd())
-    from kernelicl_clinical import (GAMMA_GRID, K_GRID, _embed, _make_clf, _make_folds,
-                                    _take, fit_explainer)
+    _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
+    for _candidate in (_here, os.getcwd(), os.path.join(os.getcwd(), "kernelicl")):
+        if _candidate and _candidate not in sys.path:
+            sys.path.insert(0, _candidate)
+    from kernelicl_clinical import (GAMMA_GRID, K_GRID, V1_CHECKPOINT, V2_CHECKPOINT,
+                                    _embed, _make_clf, _make_folds, _take,
+                                    fit_explainer)
 
 SEED = 0
 KERNELS = ("gaussian", "dot", "knn")
 COMPACTNESS_K = 5
 FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
+CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT. Ignored when
+                   # FINETUNED is set, except for the stock baselines in T2, which
+                   # should match whatever the fine-tune started from.
 
 # "accuracy" reproduces the paper, whose benchmark datasets are roughly balanced.
 # For screening it flatters the majority class. This feeds the calibration too, so it
@@ -105,7 +113,7 @@ def limits(v, margin=0.06):
 # Setup: embed once, reuse for every table and figure
 # --------------------------------------------------------------------------- #
 ex = fit_explainer(X_train, y_train, X_test, feature_names=FEATURE_NAMES,
-                   finetuned=FINETUNED)
+                   finetuned=FINETUNED, checkpoint_version=CHECKPOINT)
 clf, head, n_classes = ex.clf, ex.head, ex.clf.n_classes_
 DEVICE = ex.head.proj.weight.device.type
 
@@ -181,7 +189,8 @@ print("\n* = scale selected on held-out data")
 # TabICL-MLP is absent on purpose: in the paper it is the same architecture
 # fine-tuned with an MLP head, so without fine-tuning it is bit-identical to
 # TabICL (single). Reporting it would be inventing a number.
-clf_ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED)
+clf_ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED,
+                                **({"checkpoint_version": CHECKPOINT} if CHECKPOINT else {}))
 clf_ensemble.fit(X_train, y_train)
 
 started = time.perf_counter()
