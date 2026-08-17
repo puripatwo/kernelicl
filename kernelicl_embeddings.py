@@ -104,11 +104,16 @@ def bare(ax, title=None):
 # calibration; everything below is a view of what it already computed.
 
 # %%
-ex = fit_explainer(X_train, y_train, X_test, feature_names=FEATURE_NAMES)
+ex = fit_explainer(X_train, y_train, X_test, feature_names=FEATURE_NAMES, keep_row_repr=True)
 
 with torch.no_grad():
     H_train = ex.head.embed(ex.E_train)[0].cpu().numpy().astype(np.float64)
     H_test = ex.head.embed(ex.E_test)[0].cpu().numpy().astype(np.float64)
+    # The row-stage representation: column embedding then row interaction, before
+    # any label enters. Same shape as the in-context embedding, and free of the
+    # per-row label leakage that makes train-side ICL diagnostics vacuous.
+    ROW_train = ex.R_train[0].cpu().numpy().astype(np.float64)
+    ROW_test = ex.R_test[0].cpu().numpy().astype(np.float64)
 
 # The raw baseline: TabICL's own numeric encoding, median-imputed and z-scored.
 # Same treatment the input-space kNN baseline gets in T4, so the comparison is fair.
@@ -189,6 +194,41 @@ print(f"for contrast, train-side embedding purity at k=5: "
       f"{purity(H_train, y_enc, 5):.3f}  (label leakage, not performance)")
 
 # %% [markdown]
+# ## T6 — where the class separation actually comes from
+#
+# TabICL is three stages, and only the last one sees the labels:
+#
+# | stage | what it produces | shape | labels? |
+# |---|---|---|---|
+# | `TF_col` | one embedding per *cell* | (1, T, features+CLS, 128) | aggregate only |
+# | `TF_row` | one embedding per *case* | (1, T, 512) | no |
+# | `TF_icl` | one embedding per *case*, label-conditioned | (1, n, 512) + (1, m, 512) | yes |
+#
+# `TF_col` is per-cell rather than per-case, so it needs its own treatment (E6
+# below). `TF_row` is directly comparable to what we have been plotting, and it is
+# the interesting one: it is the model's view of a case **from its features alone**.
+#
+# Comparing raw → `TF_row` → `TF_icl` splits the credit. If `TF_row` already
+# separates the outcomes, the feature encoder is doing the work and in-context
+# learning is refining it. If `TF_row` looks like raw features and the separation
+# only appears at `TF_icl`, then the useful geometry is created by comparing
+# against a labelled context — which is worth knowing, because that is the stage a
+# kernel head reads from.
+
+# %%
+print(f"{'stage':<22}{'train-side':>11}{'test-side':>11}   note")
+T6 = []
+for name, Ptr, Pte, note in [
+    ("raw features", RAW_train, RAW_test, ""),
+    ("TF_row (no labels)", ROW_train, ROW_test, "honest on both sides"),
+    ("TF_icl (in-context)", H_train, H_test, "train side leaks labels"),
+]:
+    p_tr, p_te = purity(Ptr, y_enc, 5), purity(Pte, y_test_enc, 5)
+    T6.append(dict(stage=name, train=p_tr, test=p_te))
+    print(f"{name:<22}{p_tr:>11.3f}{p_te:>11.3f}   {note}")
+print(f"\nchance: {base_rate:.3f}   (purity@5, full-dimensional spaces)")
+
+# %% [markdown]
 # ## Projections
 #
 # Fitted on the training cases, with test cases transformed in. Not fitted on the
@@ -217,6 +257,7 @@ def project(fit_on, apply_to):
 
 PROJ_NAME, P_emb, (P_emb_test,) = project(H_train, [H_test])
 _, P_raw, (P_raw_test,) = project(RAW_train, [RAW_test])
+_, P_row, (P_row_test,) = project(ROW_train, [ROW_test])
 if PROJ_NAME == "PCA":
     print("umap-learn not installed; using PCA. `!pip install umap-learn` gives a much "
           "better picture -- PCA can only show linear structure.")
@@ -234,28 +275,30 @@ def class_style(c):
 
 
 # %% [markdown]
-# ## E1 — raw features versus the learned embedding
+# ## E1 — the three stages side by side
 #
 # The headline comparison, and the one that decides whether fine-tuning is
-# optional. Both panels are the same 2-D treatment of the same training cases;
-# only the input space differs.
+# optional. All three panels are the same 2-D treatment of the same cases; only the
+# space differs.
 #
-# What you want to see on the right: outcomes occupying distinct regions. If the
-# two panels look equally mixed, the pretrained embedding is not separating your
-# classes and no choice of kernel will rescue it.
+# What you want to see by the third panel: outcomes occupying distinct regions. If
+# all three look equally mixed, the pretrained model is not separating your classes
+# and no choice of kernel will rescue it. If panels 1 and 2 look alike and only
+# panel 3 separates, the separation is produced by in-context learning against the
+# labelled context rather than by the feature encoder.
 #
 # Coloured points are **test** cases. Training cases are the gray backdrop: they
 # show the shape of the manifold, but colouring them by outcome would draw perfect
 # separation in the right panel for the label-leakage reason above.
 
 # %%
-_t5 = {r["k"]: r for r in T5}
-_k_show = 5 if 5 in _t5 else T5[0]["k"]
+_t6 = {r["stage"]: r for r in T6}
 
-fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))
+fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6))
 for ax, P_tr, P_te, label, pk in [
-    (axes[0], P_raw, P_raw_test, "Raw features", _t5[_k_show]["raw"]),
-    (axes[1], P_emb, P_emb_test, "Learned embedding", _t5[_k_show]["embedding"]),
+    (axes[0], P_raw, P_raw_test, "1. Raw features", _t6["raw features"]["test"]),
+    (axes[1], P_row, P_row_test, "2. TF_row (features only)", _t6["TF_row (no labels)"]["test"]),
+    (axes[2], P_emb, P_emb_test, "3. TF_icl (in-context)", _t6["TF_icl (in-context)"]["test"]),
 ]:
     ax.scatter(P_tr[:, 0], P_tr[:, 1], s=4, color=GRID, linewidths=0, zorder=1)
     for c in range(n_classes):
@@ -263,7 +306,7 @@ for ax, P_tr, P_te, label, pk in [
         colour, name = class_style(c)
         ax.scatter(P_te[sel, 0], P_te[sel, 1], s=16, color=colour, alpha=0.75,
                    linewidths=0.3, edgecolors=SURFACE, zorder=2, label=name)
-    bare(ax, f"{label}   ·   test purity@{_k_show} = {pk:.3f}")
+    bare(ax, f"{label}\n   test purity@5 = {pk:.3f}")
 
 handles = []
 seen = set()
@@ -276,7 +319,7 @@ handles.append(Line2D([], [], marker="o", linestyle="", markersize=5, color=GRID
                       label="training case"))
 fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
            bbox_to_anchor=(0.5, -0.03), title="test-case outcome", title_fontsize=9)
-fig.suptitle(f"Where the outcomes sit, before and after the model ({PROJ_NAME})",
+fig.suptitle(f"Where the outcomes sit, stage by stage ({PROJ_NAME})",
              color=INK, fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
 plt.show()

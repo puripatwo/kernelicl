@@ -123,12 +123,18 @@ def _as_array(a):
     return (a.to_numpy() if hasattr(a, "to_numpy") else np.asarray(a)).ravel()
 
 
-def _embed(fitted_clf, X_query):
+def _embed(fitted_clf, X_query, return_row_repr: bool = False):
     """Symmetric in-context embeddings for a fitted classifier and a query set.
 
     The ensemble generator sits after TabICL's numeric encoder, so the query has
     to be encoded first -- this mirrors what ``predict_proba`` does internally.
     Passing raw X works for all-numeric arrays and raises on string columns.
+
+    With ``return_row_repr`` also returns the row-stage representation, the output
+    of column embedding plus row interaction before any label is added. That is the
+    model's view of a case from its features alone, and unlike the in-context
+    embedding it is free of per-row label leakage, which makes it the honest
+    "before in-context learning" baseline.
     """
     encoded = fitted_clf.X_encoder_.transform(X_query)
     X_ens, y_ens = next(iter(fitted_clf.ensemble_generator_.transform(encoded, mode="both").values()))
@@ -141,7 +147,10 @@ def _embed(fitted_clf, X_query):
             m.col_embedder(X_t, y_train=y_t, mgr_config=fitted_clf.inference_config_.COL_CONFIG),
             mgr_config=fitted_clf.inference_config_.ROW_CONFIG,
         )
-        return m.icl_predictor.embed(R, y_t, symmetric=True)
+        E_train, E_test = m.icl_predictor.embed(R, y_t, symmetric=True)
+    if return_row_repr:
+        return E_train, E_test, R
+    return E_train, E_test
 
 
 def _make_clf(device, norm_method, random_state):
@@ -171,6 +180,7 @@ def fit_explainer(
     device: Optional[str] = None,
     norm_method: str = "none",
     calibrate: bool = True,
+    keep_row_repr: bool = False,
     accuracy_tolerance: float = 0.01,
     val_size: float = 0.2,
     random_state: int = 0,
@@ -203,6 +213,12 @@ def fit_explainer(
         draws on, and an uncalibrated one typically spreads weight over the whole
         training set, giving predictions that are accurate but carry no usable
         evidence.
+
+    keep_row_repr : bool, default=False
+        Also keep the row-stage representation as ``ex.R_train`` / ``ex.R_test``:
+        column embedding plus row interaction, before any label is added. Costs
+        about 30 MB per 15,000 cases and nothing in compute, since it is computed
+        on the way to the in-context embedding regardless.
 
     calibrate : bool, default=True
         Whether to hold out a split. Turning this off skips one embedding pass,
@@ -293,9 +309,15 @@ def fit_explainer(
         say(f"  novelty threshold calibrated on {len(reference_distances):,} held-out cases")
 
     say("embedding the full training context...")
-    E_train, E_test = _embed(clf, X_test)
+    R_train = R_test = None
+    if keep_row_repr:
+        E_train, E_test, R = _embed(clf, X_test, return_row_repr=True)
+        n_ctx = len(y_train)
+        R_train, R_test = R[:, :n_ctx], R[:, n_ctx:]
+    else:
+        E_train, E_test = _embed(clf, X_test)
 
-    return ClinicalExplainer(
+    explainer = ClinicalExplainer(
         clf, head, E_train, E_test, y_train,
         kernel=kernel, gamma=gamma,
         train_ids=train_ids, test_ids=test_ids,
@@ -303,6 +325,10 @@ def fit_explainer(
         reference_distances=reference_distances,
         **explainer_kwargs,
     )
+    # The row-stage representation, for comparing what the features alone give
+    # against what in-context learning adds (see kernelicl_embeddings.py).
+    explainer.R_train, explainer.R_test = R_train, R_test
+    return explainer
 
 
 class ClinicalExplainer:
