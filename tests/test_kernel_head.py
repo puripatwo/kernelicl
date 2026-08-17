@@ -373,6 +373,67 @@ def test_assigning_a_head_does_not_break_checkpoint_loading():
     assert any(k.startswith("kernel_head") for k in model.state_dict())
 
 
+def test_forward_kernel_drops_uninformative_feature_counts():
+    """A uniform d equal to the tensor width carries no information.
+
+    `forward_kernel` drops it exactly as `_train_forward` does, which is what lets
+    it work with feature grouping enabled -- the default, and the configuration the
+    fine-tuning path uses.
+    """
+    model = make_tabicl()
+    head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    model.train()
+    X = torch.randn(2, N_TRAIN + N_TEST, 6)
+    y_train = torch.randint(0, 3, (2, N_TRAIN)).float()
+
+    for d in (None, torch.tensor([6, 6])):
+        probs, w = model.forward_kernel(X, y_train, kernel_head=head, d=d)
+        assert probs.shape == (2, N_TEST, 3)
+        torch.testing.assert_close(w.sum(-1), torch.ones(2, N_TEST))
+
+
+def test_forward_kernel_passes_feature_counts_when_grouping_is_off():
+    """Non-uniform d reaches the embedder, but only without feature grouping.
+
+    Column feature grouping asserts `d is None`, which is why TabICLv2 training
+    ignores per-dataset feature counts entirely and treats padded columns as real.
+    """
+    torch.manual_seed(0)
+    model = TabICL(max_classes=MAX_CLASSES, embed_dim=16, col_num_blocks=1, col_nhead=2,
+                   col_num_inds=8, col_feature_group=False, row_num_blocks=1, row_nhead=2,
+                   row_num_cls=2, icl_num_blocks=2, icl_nhead=2, zero_init=False)
+    model.train()
+    head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    X = torch.randn(2, N_TRAIN + N_TEST, 6)
+    y_train = torch.randint(0, 3, (2, N_TRAIN)).float()
+
+    probs, w = model.forward_kernel(X, y_train, kernel_head=head, d=torch.tensor([4, 6]))
+
+    assert probs.shape == (2, N_TEST, 3)
+    torch.testing.assert_close(w.sum(-1), torch.ones(2, N_TEST))
+
+
+def test_forward_kernel_is_trainable_in_train_mode():
+    """The fine-tuning path: gradients must reach the backbone and the projection."""
+    model = make_tabicl()
+    head = KernelHead(d_model=16 * 2, d_k=8, kernel="gaussian")
+    model.train()
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+    y_test = torch.randint(0, 3, (1, N_TEST))
+
+    probs, _ = model.forward_kernel(X, y_train, kernel_head=head, num_classes=3)
+    loss = torch.nn.functional.nll_loss((probs + 1e-8).log().reshape(-1, 3), y_test.reshape(-1))
+    loss.backward()
+
+    assert head.proj.weight.grad is not None and head.proj.weight.grad.abs().sum() > 0
+    for name, module in [("col", model.col_embedder), ("row", model.row_interactor),
+                        ("icl", model.icl_predictor.tf_icl)]:
+        grads = [p.grad for p in module.parameters() if p.grad is not None]
+        assert grads, f"no gradient reached {name}"
+        assert all(torch.isfinite(g).all() for g in grads), f"non-finite gradient in {name}"
+
+
 @torch.no_grad()
 def test_forward_kernel_regression():
     model = make_tabicl(max_classes=0)

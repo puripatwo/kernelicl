@@ -533,6 +533,7 @@ class TabICL(nn.Module):
         kernel_head: Optional[nn.Module] = None,
         num_classes: Optional[int] = None,
         gamma: Optional[Union[float, int]] = None,
+        d: Optional[Tensor] = None,
         query_chunk_size: Optional[int] = None,
         embed_with_test: bool = False,
         inference_config: Optional[InferenceConfig] = None,
@@ -562,6 +563,16 @@ class TabICL(nn.Module):
         gamma : Optional[float or int], default=None
             Overrides the head's kernel scale, for cross-validating it without
             rebuilding the head.
+
+        d : Optional[Tensor], default=None
+            Number of active features per dataset, shape (B,). Used only in training
+            mode, where synthetic-prior batches pad to a common width. A uniform ``d``
+            equal to the tensor width is dropped as uninformative.
+
+            Passing a non-uniform ``d`` requires ``col_feature_group=False``; column
+            feature grouping asserts that ``d is None``. This is why TabICLv2 training
+            ignores per-dataset feature counts and treats padded columns as real, and
+            why leaving this as None is the right default.
 
         query_chunk_size : Optional[int], default=None
             Process queries in chunks of this size to bound peak memory. See
@@ -599,8 +610,14 @@ class TabICL(nn.Module):
             )
 
         if self.training:
+            # Mirror _train_forward: a uniform d that already equals the tensor width
+            # carries no information, and the v2 default is to ignore it entirely so
+            # that padded columns are treated like any other.
+            if d is not None and len(d.unique()) == 1 and d[0] == X.shape[2]:
+                d = None
             representations = self.row_interactor(
-                self.col_embedder(X, y_train=y_train, embed_with_test=embed_with_test)
+                self.col_embedder(X, y_train=y_train, d=d, embed_with_test=embed_with_test),
+                d=d,
             )
         else:
             if inference_config is None:

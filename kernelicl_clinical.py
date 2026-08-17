@@ -153,6 +153,31 @@ def _embed(fitted_clf, X_query, return_row_repr: bool = False):
     return E_train, E_test
 
 
+def _take(X, idx):
+    """Positional row selection that works for DataFrames and arrays alike."""
+    return X.iloc[idx] if hasattr(X, "iloc") else X[idx]
+
+
+def _make_folds(y, n_folds, val_size, random_state):
+    """(train_idx, val_idx) pairs: stratified k-fold, or one held-out split."""
+    from sklearn.model_selection import StratifiedKFold, train_test_split
+
+    n = len(y)
+    counts = np.unique(y, return_counts=True)[1]
+    # StratifiedKFold needs at least n_folds members of every class; fall back to a
+    # single split rather than failing on a rare class.
+    if n_folds > 1 and counts.min() >= n_folds:
+        return list(StratifiedKFold(n_splits=n_folds, shuffle=True,
+                                    random_state=random_state).split(np.zeros(n), y))
+    if n_folds > 1:
+        print(f"  rarest class has {counts.min()} members, fewer than {n_folds} folds; "
+              f"using a single held-out split instead")
+    strat = y if counts.min() >= 2 else None
+    tr, va = train_test_split(np.arange(n), test_size=val_size,
+                              random_state=random_state, stratify=strat)
+    return [(tr, va)]
+
+
 def _make_clf(device, norm_method, random_state):
     """One ensemble member, no shuffling -- so a weight index is a training row.
 
@@ -180,6 +205,7 @@ def fit_explainer(
     device: Optional[str] = None,
     norm_method: str = "none",
     calibrate: bool = True,
+    n_folds: int = 5,
     keep_row_repr: bool = False,
     accuracy_tolerance: float = 0.01,
     val_size: float = 0.2,
@@ -221,9 +247,18 @@ def fit_explainer(
         on the way to the in-context embedding regardless.
 
     calibrate : bool, default=True
-        Whether to hold out a split. Turning this off skips one embedding pass,
-        but then ``gamma`` must be supplied and the novelty flag falls back to a
-        cohort-relative reading rather than a training-range one.
+        Whether to hold out data for calibration. Turning this off skips the extra
+        embedding passes, but then ``gamma`` must be supplied and the novelty flag
+        falls back to a cohort-relative reading rather than a training-range one.
+
+    n_folds : int, default=5
+        Stratified k-fold cross-validation for the kernel scale, following the
+        paper. Costs one embedding pass per fold, so five folds means roughly six
+        passes in total rather than two -- worth it for the scale that every
+        downstream inspection depends on, and it improves the novelty threshold
+        too, which is then calibrated on every training case rather than 20% of
+        them. Set to 1 for a single held-out split. Falls back to one split
+        automatically if the rarest class has fewer members than ``n_folds``.
 
     accuracy_tolerance : float, default=0.01
         How much held-out accuracy to trade for inspectability. Among scales
@@ -267,45 +302,61 @@ def fit_explainer(
 
     reference_distances = None
     if calibrate:
-        from sklearn.model_selection import train_test_split
+        grid = K_GRID if kernel == "knn" else GAMMA_GRID
+        folds = _make_folds(y_train, n_folds, val_size, random_state)
+        say(f"calibrating over {len(folds)} fold(s) "
+            f"({len(folds)} extra embedding pass{'es' if len(folds) > 1 else ''})...")
 
-        say("calibrating on a held-out split (one extra embedding pass)...")
-        strat = y_train if len(np.unique(y_train)) < len(y_train) // 2 else None
-        Xa, Xb, ya, yb = train_test_split(X_train, y_train, test_size=val_size,
-                                          random_state=random_state, stratify=strat)
-        cal = _make_clf(device, norm_method, random_state)
-        cal.fit(Xa, ya)
-        E_cal_train, E_cal_val = _embed(cal, Xb)
-        y_cal = torch.from_numpy(cal.y_encoder_.transform(_as_array(ya))).float().to(device)[None]
+        scores = {scale: [] for scale in grid}     # metric per fold
+        perps = {scale: [] for scale in grid}      # relative perplexity per fold
+        ref_chunks = []
 
-        # The scale never touches the embedding, so the whole grid is swept over
-        # embeddings computed once. This is what makes calibration cheap.
+        for i, (tr_idx, va_idx) in enumerate(folds, 1):
+            Xa, ya = _take(X_train, tr_idx), y_train[tr_idx]
+            Xb, yb = _take(X_train, va_idx), y_train[va_idx]
+            cal = _make_clf(device, norm_method, random_state)
+            cal.fit(Xa, ya)
+            E_cal_train, E_cal_val = _embed(cal, Xb)
+            y_cal = torch.from_numpy(cal.y_encoder_.transform(ya)).float().to(device)[None]
+            ref_chunks.append(ClinicalExplainer.reference_distances_from(head, E_cal_train, E_cal_val))
+
+            if gamma is None:
+                # The scale never touches the embedding, so the whole grid is swept
+                # over embeddings computed once per fold. That is what keeps 5-fold
+                # calibration to 5 embedding passes rather than 5 x len(grid).
+                for scale in grid:
+                    with torch.no_grad():
+                        probs, w = head(E_cal_train, E_cal_val, y_cal,
+                                        num_classes=cal.n_classes_, gamma=scale)
+                    pred = cal.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
+                    scores[scale].append(float((pred == yb).mean()))
+                    perps[scale].append(float(relative_perplexity(w).mean()))
+            say(f"  fold {i}/{len(folds)} done")
+
+        # Averaging over folds is also what makes the tie-break below less
+        # load-bearing than it is with a single split: five estimates produce finer
+        # grained accuracies, so exact ties are rarer.
         if gamma is None:
-            rows = []
-            for scale in (K_GRID if kernel == "knn" else GAMMA_GRID):
-                with torch.no_grad():
-                    probs, w = head(E_cal_train, E_cal_val, y_cal,
-                                    num_classes=cal.n_classes_, gamma=scale)
-                pred = cal.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
-                rows.append((scale, float((pred == _as_array(yb)).mean()),
-                             float(relative_perplexity(w).mean())))
+            rows = [(scale, float(np.mean(scores[scale])), float(np.mean(perps[scale])))
+                    for scale in grid]
             # Picking the most accurate scale is the wrong rule here. Accuracy is
-            # typically flat across much of the grid while the evidence base
-            # varies by orders of magnitude, so a plain argmax returns a kernel
-            # that averages over the whole training set -- accurate, and useless
-            # to a clinician, since no small set of past cases explains anything.
+            # typically flat across much of the grid while the evidence base varies
+            # by orders of magnitude, so a plain argmax returns a kernel that
+            # averages over the whole training set -- accurate, and useless to a
+            # clinician, since no small set of past cases explains anything.
             # Instead: among scales within `accuracy_tolerance` of the best, take
             # the sparsest. This buys inspectability at a bounded, stated cost.
             best_acc = max(r[1] for r in rows)
             candidates = [r for r in rows if r[1] >= best_acc - accuracy_tolerance]
             gamma, acc, ppl = min(candidates, key=lambda r: r[2])
-            n_ctx = len(ya)
-            say(f"  scale={gamma}  held-out accuracy={acc:.3f} "
-                f"(best on grid {best_acc:.3f}, gave up {best_acc - acc:.3f} "
+            n_ctx = len(folds[0][0])
+            spread = float(np.std(scores[gamma]))
+            say(f"  scale={gamma}  cross-validated accuracy={acc:.3f} (+/-{spread:.3f} across folds; "
+                f"best on grid {best_acc:.3f}, gave up {best_acc - acc:.3f} "
                 f"within tolerance {accuracy_tolerance})")
             say(f"  evidence base ≈ {ppl * n_ctx:.0f} of {n_ctx:,} cases per prediction")
 
-        reference_distances = ClinicalExplainer.reference_distances_from(head, E_cal_train, E_cal_val)
+        reference_distances = np.concatenate(ref_chunks)
         say(f"  novelty threshold calibrated on {len(reference_distances):,} held-out cases")
 
     say("embedding the full training context...")
