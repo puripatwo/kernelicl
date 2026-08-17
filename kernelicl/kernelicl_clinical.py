@@ -19,7 +19,8 @@ import torch
 from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import KernelHead, relative_perplexity, squared_distances
 
-__all__ = ["ClinicalExplainer", "fit_explainer", "V1_CHECKPOINT", "V2_CHECKPOINT"]
+__all__ = ["ClinicalExplainer", "fit_explainer", "as_array", "standardized_numeric",
+           "V1_CHECKPOINT", "V2_CHECKPOINT"]
 
 # Wider at the top end than the paper's Table 7: an untrained projection leaves the
 # embeddings on a scale where the useful region sits higher.
@@ -39,8 +40,28 @@ def _bar(share: float, width: int = 12) -> str:
     return ("█" * int(round(share * width))).ljust(width, "·")
 
 
-def _as_array(a) -> np.ndarray:
+def as_array(a) -> np.ndarray:
+    """A flat numpy array. Series are coerced because weights index rows positionally,
+    and a non-default index would silently turn that into a label lookup."""
     return (a.to_numpy() if hasattr(a, "to_numpy") else np.asarray(a)).ravel()
+
+
+def standardized_numeric(clf, X_train, X_test):
+    """Both matrices through TabICL's numeric encoder, median-imputed and z-scored.
+
+    The input-space baselines need a numeric, NaN-free matrix, which raw X may not be.
+    Reusing the model's own encoder maps string and categorical columns the way the
+    model sees them. Imputation is for sklearn's benefit: TabICL handles NaN, its
+    neighbour baselines do not.
+    """
+    train = np.asarray(clf.X_encoder_.transform(X_train), dtype=float)
+    test = np.asarray(clf.X_encoder_.transform(X_test), dtype=float)
+    median = np.nan_to_num(np.nanmedian(train, axis=0))
+    train = np.where(np.isnan(train), median, train)
+    test = np.where(np.isnan(test), median, test)
+    mean, sd = train.mean(0), train.std(0)
+    sd = np.where(sd == 0, 1.0, sd)
+    return (train - mean) / sd, (test - mean) / sd
 
 
 def _take(X, idx):
@@ -197,7 +218,7 @@ def fit_explainer(
         if verbose:
             print(msg)
 
-    y_train = _as_array(y_train)
+    y_train = as_array(y_train)
     if feature_names is None and hasattr(X_train, "columns"):
         feature_names = list(X_train.columns)
     if device is None:
@@ -361,7 +382,7 @@ class ClinicalExplainer:
         self.top_k, self.min_agreement = top_k, min_agreement
         self.X_train, self.X_test = X_train, X_test
         self.feature_names = feature_names
-        self.y_train = _as_array(y_train)
+        self.y_train = as_array(y_train)
         self.n, self.m = E_train.shape[1], E_test.shape[1]
         self.train_ids = np.asarray(train_ids if train_ids is not None else np.arange(self.n))
         self.test_ids = np.asarray(test_ids if test_ids is not None else np.arange(self.m))
@@ -532,7 +553,7 @@ class ClinicalExplainer:
         embedding and so carries *less* weight than average, so filtering by
         influence discards exactly the records being hunted.
         """
-        y_test = _as_array(y_test)
+        y_test = as_array(y_test)
         wrong = self.pred != y_test
         columns = ["record", "stored_outcome", "error_share", "weight_on_errors",
                    "total_influence", "cases_influenced"]
@@ -578,7 +599,7 @@ class ClinicalExplainer:
         same group. A low value means predictions for that group are extrapolated
         from a different population, which can happen at equal accuracy.
         """
-        train_groups, test_groups = _as_array(train_groups), _as_array(test_groups)
+        train_groups, test_groups = as_array(train_groups), as_array(test_groups)
         if len(train_groups) != self.n or len(test_groups) != self.m:
             raise ValueError(f"expected {self.n} train and {self.m} test group labels, "
                              f"got {len(train_groups)} and {len(test_groups)}")
@@ -627,17 +648,7 @@ class ClinicalExplainer:
                              "or build the explainer with fit_explainer()")
         feature_names = feature_names if feature_names is not None else self.feature_names
 
-        # TabICL's own encoder, so string columns map as the model sees them. NaNs
-        # are median-imputed for the sklearn baseline only.
-        Xtr = np.asarray(self.clf.X_encoder_.transform(X_train), dtype=float)
-        Xte = np.asarray(self.clf.X_encoder_.transform(X_test), dtype=float)
-        median = np.nan_to_num(np.nanmedian(Xtr, axis=0))
-        Xtr = np.where(np.isnan(Xtr), median, Xtr)
-        Xte = np.where(np.isnan(Xte), median, Xte)
-
-        mean, sd = Xtr.mean(0), Xtr.std(0)
-        sd = np.where(sd == 0, 1.0, sd)
-        Xtr_s, Xte_s = (Xtr - mean) / sd, (Xte - mean) / sd
+        Xtr_s, Xte_s = standardized_numeric(self.clf, X_train, X_test)
 
         idx_model = np.argsort(-self.w, axis=1)[:, :k]
         idx_plain = NearestNeighbors(n_neighbors=k).fit(Xtr_s).kneighbors(
@@ -649,7 +660,7 @@ class ClinicalExplainer:
 
         model_c, plain_c = compactness(idx_model), compactness(idx_plain)
         names = feature_names if feature_names is not None else [
-            f"feature {i}" for i in range(Xtr.shape[1])]
+            f"feature {i}" for i in range(Xtr_s.shape[1])]
         return (pd.DataFrame({
                     "feature": [str(n) for n in names],
                     "plain_knn": plain_c,

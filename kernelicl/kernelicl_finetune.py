@@ -428,74 +428,68 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
           f"= effective batch {accum * cfg.micro_batch}\n")
 
     history = {"step": [], "loss": [], "val": []}
-    try:
-        _train_loop(cfg, model, head, prior, val_batches, optimizer, scheduler, scaler,
-                    backbone_params + head_params, amp_on, amp_dtype, accum, device,
-                    num_classes, model_config, d_model, history)
-    finally:
-        prior.close()
-    return history
-
-
-def _train_loop(cfg, model, head, prior, val_batches, optimizer, scheduler, scaler,
-                params, amp_on, amp_dtype, accum, device, num_classes, model_config,
-                d_model, history):
-    """The step loop, split out so the prefetcher can be closed on any exit path."""
+    params = backbone_params + head_params
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
 
-    for step in range(cfg.steps):
-        optimizer.zero_grad(set_to_none=True)
-        totals = np.zeros(3)  # loss, accuracy, perplexity
-        n_micro = 0
+    try:
+        for step in range(cfg.steps):
+            optimizer.zero_grad(set_to_none=True)
+            totals = np.zeros(3)  # loss, accuracy, perplexity
+            n_micro = 0
 
-        for _ in range(accum):
-            batch = prior.get_batch()
-            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
-                loss, _n_used, accuracy, perplexity = _forward_batch(
-                    model, head, batch, cfg, device, num_classes)
-            if loss is None:
+            for _ in range(accum):
+                batch = prior.get_batch()
+                with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
+                    loss, _n_used, accuracy, perplexity = _forward_batch(
+                        model, head, batch, cfg, device, num_classes)
+                if loss is None:
+                    continue
+                scaler.scale(loss / accum).backward()
+                totals += (loss.item(), accuracy, perplexity)
+                n_micro += 1
+
+            if n_micro == 0:
                 continue
-            scaler.scale(loss / accum).backward()
-            totals += (loss.item(), accuracy, perplexity)
-            n_micro += 1
 
-        if n_micro == 0:
-            continue
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
 
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+            mean_loss, mean_acc, mean_ppl = totals / n_micro
+            history["step"].append(step)
+            history["loss"].append(mean_loss)
 
-        mean_loss, mean_acc, mean_ppl = totals / n_micro
-        history["step"].append(step)
-        history["loss"].append(mean_loss)
+            if step % cfg.log_every == 0 or step == cfg.steps - 1:
+                rate = (step + 1) / (time.perf_counter() - started)
+                print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
+                      f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
+                      f"{rate:.2f} step/s")
 
-        if step % cfg.log_every == 0 or step == cfg.steps - 1:
-            rate = (step + 1) / (time.perf_counter() - started)
-            print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
-                  f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
-                  f"{rate:.2f} step/s")
+            if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
+                metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
+                history["val"].append({"step": step, **metrics})
+                improved = metrics["loss"] < best_val
+                if improved:
+                    best_val = metrics["loss"]
+                    _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
+                                     cfg, best_val)
+                    saved_any = True
+                print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
+                      f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
+                      f"{'  <- best, saved' if improved else ''}")
 
-        if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
-            metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
-            history["val"].append({"step": step, **metrics})
-            improved = metrics["loss"] < best_val
-            if improved:
-                best_val = metrics["loss"]
-                _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
-                                 cfg, best_val)
-                saved_any = True
-            print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
-                  f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
-                  f"{'  <- best, saved' if improved else ''}")
+    finally:
+        # Background generation threads must not outlive the run.
+        prior.close()
 
     if not saved_any:
         print("\nno validation checkpoint was taken; nothing saved")
     else:
         print(f"\nbest checkpoint at {cfg.out_path} (validation loss {best_val:.4f})")
+    return history
 
 
 def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, KernelHead]:

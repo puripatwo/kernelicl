@@ -25,13 +25,14 @@ if "fit_explainer" not in globals():
     import os
     import sys
 
+    # V1_CHECKPOINT / V2_CHECKPOINT are imported for CHECKPOINT below, not used here.
     _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
     for _candidate in (_here, os.getcwd(), os.path.join(os.getcwd(), "kernelicl")):
         if _candidate and _candidate not in sys.path:
             sys.path.insert(0, _candidate)
     from kernelicl_clinical import (GAMMA_GRID, K_GRID, V1_CHECKPOINT, V2_CHECKPOINT,
-                                    _embed, _make_clf, _make_folds, _take,
-                                    fit_explainer)
+                                    _embed, _make_clf, _make_folds, _take, as_array,
+                                    fit_explainer, standardized_numeric)
 
 SEED = 0
 KERNELS = ("gaussian", "dot", "knn")
@@ -47,8 +48,7 @@ CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT. Ignored whe
 METRIC = "balanced_accuracy"   # "accuracy" | "balanced_accuracy"
 
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
-y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
-y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
+y_train, y_test = as_array(y_train), as_array(y_test)
 
 
 def evaluate(y_true, y_pred) -> float:
@@ -252,14 +252,7 @@ plt.show()
 # --------------------------------------------------------------------------- #
 # Relative perplexity is k/n for both methods, so equal k means equal
 # inspectability and the only difference is which neighbours get chosen.
-Xtr_num = np.asarray(clf.X_encoder_.transform(X_train), dtype=float)
-Xte_num = np.asarray(clf.X_encoder_.transform(X_test), dtype=float)
-median = np.nan_to_num(np.nanmedian(Xtr_num, axis=0))
-Xtr_num = np.where(np.isnan(Xtr_num), median, Xtr_num)
-Xte_num = np.where(np.isnan(Xte_num), median, Xte_num)
-mean, sd = Xtr_num.mean(0), Xtr_num.std(0)
-sd = np.where(sd == 0, 1.0, sd)
-Xtr_s, Xte_s = (Xtr_num - mean) / sd, (Xte_num - mean) / sd
+Xtr_s, Xte_s = standardized_numeric(clf, X_train, X_test)
 
 print(f"\n{'k':>6} {'rel.PPL%':>10} {'KernelICL':>11} {'plain kNN':>11} {'delta pp':>10}")
 T4 = []

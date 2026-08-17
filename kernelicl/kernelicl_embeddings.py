@@ -24,11 +24,13 @@ if "fit_explainer" not in globals():
     import os
     import sys
 
+    # V1_CHECKPOINT / V2_CHECKPOINT are imported for CHECKPOINT below, not used here.
     _here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else None
     for _candidate in (_here, os.getcwd(), os.path.join(os.getcwd(), "kernelicl")):
         if _candidate and _candidate not in sys.path:
             sys.path.insert(0, _candidate)
-    from kernelicl_clinical import V1_CHECKPOINT, V2_CHECKPOINT, fit_explainer
+    from kernelicl_clinical import (V1_CHECKPOINT, V2_CHECKPOINT, as_array,
+                                    fit_explainer, standardized_numeric)
 
 SEED = 0
 PURITY_K = (1, 5, 10, 20, 50)
@@ -36,8 +38,7 @@ FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
 CHECKPOINT = None  # None = TabICL's default (v2); or V1_CHECKPOINT
 
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
-y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
-y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
+y_train, y_test = as_array(y_train), as_array(y_test)
 
 
 # --------------------------------------------------------------------------- #
@@ -95,14 +96,7 @@ with torch.no_grad():
     ROW_test = ex.R_test[0].cpu().numpy().astype(np.float64)
 
 # Raw baseline, given the same treatment as the input-space kNN in T4.
-Xtr_num = np.asarray(ex.clf.X_encoder_.transform(X_train), dtype=float)
-Xte_num = np.asarray(ex.clf.X_encoder_.transform(X_test), dtype=float)
-median = np.nan_to_num(np.nanmedian(Xtr_num, axis=0))
-Xtr_num = np.where(np.isnan(Xtr_num), median, Xtr_num)
-Xte_num = np.where(np.isnan(Xte_num), median, Xte_num)
-mean, sd = Xtr_num.mean(0), Xtr_num.std(0)
-sd = np.where(sd == 0, 1.0, sd)
-RAW_train, RAW_test = (Xtr_num - mean) / sd, (Xte_num - mean) / sd
+RAW_train, RAW_test = standardized_numeric(ex.clf, X_train, X_test)
 
 y_enc = ex.clf.y_encoder_.transform(y_train)
 y_test_enc = ex.clf.y_encoder_.transform(y_test)
@@ -286,7 +280,7 @@ plt.show()
 # An independent cross-check: T3 works from neighbour sets, this from the geometry.
 emphasis = ex.feature_emphasis()
 names = [str(n) for n in (FEATURE_NAMES if FEATURE_NAMES is not None
-                          else [f"feature {i}" for i in range(Xtr_num.shape[1])])]
+                          else [f"feature {i}" for i in range(RAW_train.shape[1])])]
 
 fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.6), sharex=True, sharey=True)
 for ax, position, tag in [(axes[0], 0, "most emphasised"), (axes[1], -1, "least emphasised")]:
