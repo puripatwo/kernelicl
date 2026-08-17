@@ -22,12 +22,33 @@ held-out split, and calibrates the novelty threshold::
         test_ids=patient_ids_test,
     )
 
-    ex.triage()                          # every case, ranked by review priority
-    ex.triage_summary()                  # how the caseload splits
-    ex.audit_labels(y_test)              # candidate mislabelled training records
-    ex.equity(site_train, site_test)     # evidence sources by subgroup
-    ex.feature_emphasis()                # what the model treats as "similar"
-    ex.export("report", y_test=y_test)   # CSVs for people without Python
+Every method **returns** a value rather than printing one, so assign it and then
+display or print it. Two return types, and they are displayed differently:
+
+*Text* -- ``case()`` and ``report()`` return a string, so ``print()`` them, or the
+newlines show up as ``\\n``::
+
+    cards = ex.with_kernel("knn", gamma=5)   # see below
+    print(cards.case(0))                     # one case, as a readable card
+    print(ex.report(n_cases=3))              # caseload summary + worked examples
+
+*Tables* -- everything else returns a ``pandas.DataFrame``. In a notebook, put one
+on the last line of a cell to render it, or call ``display()`` for several in the
+same cell::
+
+    triage = ex.triage()                 # one row per case, review priority first
+    triage.head(20)                      # last line of the cell -> renders
+
+    summary = ex.triage_summary()        # how the caseload splits by action
+    audit   = ex.audit_labels(y_test)    # candidate mislabelled training records
+    equity  = ex.equity(site_train, site_test)
+    emphasis = ex.feature_emphasis()     # what the model treats as "similar"
+
+    from IPython.display import display  # to show several at once
+    display(summary, audit.head(10), equity)
+
+    paths = ex.export("report", y_test=y_test)   # writes CSVs, returns the paths
+    print(paths)
 
 For the per-case cards a clinician reads, switch to the kNN kernel. It costs a
 matrix multiply, not another model run, and it is the difference between "these
@@ -39,6 +60,24 @@ matrix multiply, not another model run, and it is the difference between "these
 
 ``y_test`` is needed only for the label audit and the CSV export -- prediction,
 triage, equity and feature emphasis never see it.
+
+Returns at a glance
+-------------------
+===============================  ==========================================
+``fit_explainer(...)``           ``ClinicalExplainer``
+``ex.with_kernel(...)``          ``ClinicalExplainer``
+``ex.case(i)``                   ``str``  -- print it
+``ex.report(...)``               ``str``  -- print it
+``ex.triage()``                  ``DataFrame``, one row per test case
+``ex.triage_summary()``          ``DataFrame``, one row per action
+``ex.neighbours(i)``             ``DataFrame``, the cases behind prediction i
+``ex.audit_labels(y_test)``      ``DataFrame``; ``.attrs["n_errors"]`` holds the
+                                 number of mistakes it had to work from
+``ex.influence()``               ``DataFrame``, one row per training record
+``ex.equity(gtr, gte)``          ``DataFrame``, one row per group
+``ex.feature_emphasis()``        ``DataFrame``, one row per feature
+``ex.export(dir, y_test=...)``   ``list[str]`` of written CSV paths
+===============================  ==========================================
 
 If you already have a fitted classifier and embeddings (say from
 ``kernelicl_analysis.py``), construct :class:`ClinicalExplainer` directly instead;
