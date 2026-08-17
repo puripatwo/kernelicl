@@ -20,6 +20,9 @@
 # Note the `-b kernelicl-head` — the kernel head lives on that branch, not `main`.
 # Set the runtime to a GPU (Runtime → Change runtime type → T4 or better) *before*
 # installing. Restart the session after `pip install -e .` if it upgraded numpy.
+#
+# **Paste order:** independent. Needs only `X_train`, `y_train`, `X_test`, `y_test`
+# in the session. Paste the whole file into one cell, or `%run -i kernelicl_colab.py`.
 
 # %%
 import numpy as np

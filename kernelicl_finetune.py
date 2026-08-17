@@ -22,19 +22,57 @@ scaled-down configurations that fit smaller cards; the small one runs on a T4 an
 will not reproduce the paper's numbers, but it will tell you whether fine-tuning
 moves your own metrics in the right direction before you pay for an A100.
 
-Usage
------
-::
+Usage in Colab
+--------------
+Set the runtime to a GPU **before** installing -- changing runtime type afterwards
+destroys the VM and everything on it. Then::
 
-    !pip install -e ".[pretrain]"          # the prior needs xgboost
-    %run kernelicl_finetune.py             # or paste into a cell
+    !git clone -b kernelicl-head https://github.com/puripatwo/kernelicl.git
+    %cd kernelicl
+    !pip install -q -e ".[pretrain]"       # the prior needs xgboost
 
-    # then, with the rest of the tooling:
-    model, head = load_finetuned("kernelicl_finetuned.pt", device="cuda")
+Paste this file into a cell and run it. Nothing trains on import -- it defines
+functions and prints what to do next. Then, in separate cells:
 
-Run ``smoke_test()`` first. It executes two optimiser steps on tiny batches and
-takes about a minute on CPU, which is much cheaper than discovering a shape error
-forty minutes into a GPU run.
+**1. Smoke test first.** Two optimiser steps on tiny batches, about a minute on
+CPU. Much cheaper than discovering a shape error forty minutes into a GPU run::
+
+    smoke_test()
+
+**2. Train.** Pick a preset by the card you have. Each prints its progress, so you
+can stop early if the validation loss stalls::
+
+    history = finetune(preset="small")     # T4 / 16 GB, ~30 min, a sanity run
+    history = finetune(preset="medium")    # 24 GB, a few hours, a real run
+    history = finetune(preset="paper")     # A100 / 40 GB, Appendix A verbatim
+
+**3. Use it.** The one flag that matters -- pass the checkpoint to
+``fit_explainer`` and everything downstream uses the fine-tuned model, with the
+kernel scale recalibrated for its new geometry::
+
+    ex = fit_explainer(X_train, y_train, X_test,
+                       finetuned="kernelicl_finetuned.pt")
+    print(ex.with_kernel("knn", gamma=5).case(0))
+
+Or load the raw pieces if you want to drive the model yourself::
+
+    model, head = load_finetuned("kernelicl_finetuned.pt")
+
+Paste order
+-----------
+``kernelicl_clinical.py`` before this file if you want step 3 in the same session;
+``fit_explainer`` lives there. Everything else is independent.
+
+Colab disconnects
+-----------------
+A long run will outlive your patience before it outlives the session, but not
+always the other way round. The best checkpoint is written every time validation
+improves, so a disconnect costs you the time since the last improvement rather
+than the whole run. Save to Drive if you care about it::
+
+    from google.colab import drive; drive.mount("/content/drive")
+    finetune(FinetuneConfig(**{**PRESETS["medium"].__dict__,
+                               "out_path": "/content/drive/MyDrive/kicl_ft.pt"}))
 """
 
 from __future__ import annotations
@@ -479,5 +517,32 @@ def smoke_test(device: str = "cpu") -> None:
     print("=== smoke test passed: forward, backward, save and reload all work ===")
 
 
+_BANNER = """kernelicl_finetune loaded. Nothing has trained yet.
+
+  1. smoke_test()                     two steps on tiny batches, ~1 min, do this first
+  2. finetune(preset="small")         T4 / 16 GB      ~30 min, a sanity run
+     finetune(preset="medium")        24 GB           a few hours, a real run
+     finetune(preset="paper")         A100 / 40 GB    Appendix A verbatim
+  3. fit_explainer(X_train, y_train, X_test, finetuned="kernelicl_finetuned.pt")
+
+Presets differ in steps, batch size, sequence length and feature count -- inspect
+PRESETS["small"] to see exactly what was traded away."""
+
+
+def _in_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+
+        return get_ipython() is not None
+    except ImportError:
+        return False
+
+
 if __name__ == "__main__":
-    smoke_test()
+    # A pasted Colab cell also has __name__ == "__main__", so guard on the
+    # interpreter rather than the name: pasting this file should not silently start
+    # downloading a checkpoint and training. From a shell, run the smoke test.
+    if _in_notebook():
+        print(_BANNER)
+    else:
+        smoke_test()

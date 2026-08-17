@@ -14,7 +14,13 @@
 # !pip install -e . umap-learn
 # ```
 #
-# Expects `X_train`, `X_test`, `y_train`, `y_test` in memory as numpy arrays.
+# Expects `X_train`, `y_train`, `X_test`, `y_test` in the session. A DataFrame with
+# string columns and NaNs is fine.
+#
+# **Paste order:** independent — paste the whole file into one cell, or
+# `%run -i kernelicl_analysis.py`. It redoes its own setup, so it does not matter
+# whether `kernelicl_colab.py` ran first; note only that both define names like
+# `clf` and `head`, so whichever ran last owns them.
 
 # %%
 import time
@@ -404,8 +410,12 @@ except ImportError:
     PROJ_NAME = "PCA"
     print("umap-learn not installed; using PCA. `!pip install umap-learn` for the paper's layout.")
 
-proj = np.asarray(_reducer.transform(H_train.astype(np.float64)))
-proj_test = np.asarray(_reducer.transform(H_test.astype(np.float64)))
+# numpy emits spurious overflow/divide warnings from the projection matmul on
+# well-conditioned input in some environments; outputs are asserted finite below.
+with np.errstate(all="ignore"):
+    proj = np.asarray(_reducer.transform(H_train.astype(np.float64)))
+    proj_test = np.asarray(_reducer.transform(H_test.astype(np.float64)))
+assert np.isfinite(proj).all() and np.isfinite(proj_test).all()
 order = np.argsort(proj[:, 0])  # training samples sorted along the first component
 print(f"{PROJ_NAME} projection: train {proj.shape}, test {proj_test.shape}")
 

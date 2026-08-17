@@ -24,7 +24,11 @@
 # !pip install -e . umap-learn
 # ```
 #
-# Expects `X_train`, `y_train`, `X_test`, `y_test` in memory.
+# Expects `X_train`, `y_train`, `X_test`, `y_test` in the session.
+#
+# **Paste order:** paste `kernelicl_clinical.py` first — `fit_explainer` lives there.
+# If you cloned the repo it will import instead, so order only matters when pasting
+# rather than running from the checkout.
 
 # %%
 import numpy as np

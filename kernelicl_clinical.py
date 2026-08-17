@@ -178,6 +178,33 @@ def _make_folds(y, n_folds, val_size, random_state):
     return [(tr, va)]
 
 
+def _load_finetuned_payload(path):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    for key in ("config", "state_dict", "kernel_head", "head_config"):
+        if key not in payload:
+            raise ValueError(f"{path} is missing '{key}'; expected a checkpoint written "
+                             f"by kernelicl_finetune.finetune()")
+    return payload
+
+
+def _swap_in_finetuned(clf, payload, device):
+    """Replace a fitted classifier's pretrained model with fine-tuned weights.
+
+    The classifier is still needed for its preprocessing, label encoder and
+    inference config -- only the network is swapped. Rebuilt from the checkpoint's
+    own config rather than loaded into the existing module, because a fine-tune may
+    have started from a different TabICL version than the one the classifier
+    downloaded.
+    """
+    from tabicl._model.tabicl import TabICL
+
+    model = TabICL(**payload["config"])
+    model.load_state_dict(payload["state_dict"])
+    clf.model_ = model.to(device).eval()
+    clf.model_config_ = payload["config"]
+    return clf
+
+
 def _make_clf(device, norm_method, random_state):
     """One ensemble member, no shuffling -- so a weight index is a training row.
 
@@ -204,6 +231,7 @@ def fit_explainer(
     feature_names: Optional[Sequence] = None,
     device: Optional[str] = None,
     norm_method: str = "none",
+    finetuned: Optional[str] = None,
     calibrate: bool = True,
     n_folds: int = 5,
     keep_row_repr: bool = False,
@@ -271,6 +299,15 @@ def fit_explainer(
         read; set it to 0.0 if accuracy is all you care about, in which case you
         probably do not need this module.
 
+    finetuned : str, optional
+        Path to a checkpoint from ``kernelicl_finetune.finetune()``. The pretrained
+        network is replaced by the fine-tuned one and the trained projection ``W``
+        is used in place of the identity, in every fold as well as the final fit --
+        calibrating the scale on the pretrained geometry and then applying it to a
+        fine-tuned one would pick the wrong scale entirely. ``kernel`` still selects
+        the kernel type, so a model trained with the Gaussian kernel can be read
+        through kNN, which is what the paper does.
+
     norm_method : str, default="none"
         TabICL feature normalization: ``"none"``, ``"power"``, ``"quantile"``,
         ``"quantile_rtdl"``, ``"robust"``. With many real-world features
@@ -293,12 +330,30 @@ def fit_explainer(
     if not calibrate and gamma is None:
         raise ValueError("gamma must be supplied when calibrate=False")
 
+    payload = _load_finetuned_payload(finetuned) if finetuned else None
+
+    def fit_clf(X, y):
+        """A fitted classifier, with fine-tuned weights swapped in if supplied."""
+        c = _make_clf(device, norm_method, random_state)
+        c.fit(X, y)
+        return _swap_in_finetuned(c, payload, device) if payload else c
+
     say(f"fitting on {len(y_train):,} training cases, scoring {len(X_test):,} "
-        f"(device={device}, kernel={kernel})")
-    clf = _make_clf(device, norm_method, random_state)
-    clf.fit(X_train, y_train)
-    d_model = clf.model_.icl_predictor.decoder[0].in_features
-    head = KernelHead(d_model=d_model, d_k=d_model, kernel=kernel, identity_init=True).to(device)
+        f"(device={device}, kernel={kernel}"
+        f"{', fine-tuned' if payload else ''})")
+    clf = fit_clf(X_train, y_train)
+
+    if payload:
+        hc = payload["head_config"]
+        head = KernelHead(d_model=hc["d_model"], d_k=hc["d_k"], kernel=kernel).to(device)
+        head.load_state_dict(payload["kernel_head"])
+        d_model = hc["d_model"]
+        say(f"  loaded fine-tuned projection ({hc['d_model']}->{hc['d_k']}, "
+            f"trained with kernel={hc['kernel']}, validation loss "
+            f"{payload.get('val_loss', float('nan')):.4f})")
+    else:
+        d_model = clf.model_.icl_predictor.decoder[0].in_features
+        head = KernelHead(d_model=d_model, d_k=d_model, kernel=kernel, identity_init=True).to(device)
 
     reference_distances = None
     if calibrate:
@@ -314,8 +369,7 @@ def fit_explainer(
         for i, (tr_idx, va_idx) in enumerate(folds, 1):
             Xa, ya = _take(X_train, tr_idx), y_train[tr_idx]
             Xb, yb = _take(X_train, va_idx), y_train[va_idx]
-            cal = _make_clf(device, norm_method, random_state)
-            cal.fit(Xa, ya)
+            cal = fit_clf(Xa, ya)
             E_cal_train, E_cal_val = _embed(cal, Xb)
             y_cal = torch.from_numpy(cal.y_encoder_.transform(ya)).float().to(device)[None]
             ref_chunks.append(ClinicalExplainer.reference_distances_from(head, E_cal_train, E_cal_val))
