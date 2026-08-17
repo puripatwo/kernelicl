@@ -35,9 +35,15 @@ __all__ = ["FinetuneConfig", "PRESETS", "finetune", "load_finetuned", "smoke_tes
 class FinetuneConfig:
     """What gets trained, on what, and for how long."""
 
-    # Starting point. v1 is the checkpoint the paper built on; the repo default is
-    # now v2, which has a different prior.
+    # Starting point. v1 is the checkpoint the paper built on; v2 is stronger but was
+    # pretrained on a different prior, so match prior_type below to whichever you use.
     checkpoint: str = "tabicl-classifier-v1-20250208.ckpt"
+
+    prior_type: str = "mlp_scm"
+    """Which synthetic prior to sample. "mlp_scm" is Appendix A ("random MLP
+    functions") and suits the v1 checkpoint; "graph_scm" is what v2 was pretrained on.
+    Also accepts "tree_scm" and "mix_scm". Fine-tuning against a prior the checkpoint
+    never saw asks it to adapt to two things at once."""
 
     # Trained with the Gaussian kernel: kNN is non-differentiable, so the paper
     # trains Gaussian and swaps the kernel at evaluation. Dot-product is a separate run.
@@ -83,6 +89,8 @@ class FinetuneConfig:
     device: Optional[str] = None
     log_every: int = 25
 
+
+V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 
 PRESETS = {
     "paper": FinetuneConfig(),
@@ -196,6 +204,7 @@ def _make_prior(cfg):
     def build(n_jobs):
         return PriorDataset(
             regression=False,
+            prior_type=cfg.prior_type,
             batch_size=cfg.micro_batch,
             min_features=cfg.min_features,
             max_features=cfg.max_features,
@@ -417,6 +426,12 @@ def smoke_test(device: Optional[str] = None) -> None:
 # history = finetune(preset="small")        # T4 / 16 GB    ~30 min, a sanity run
 # history = finetune(preset="medium")       # 24 GB         a few hours
 # history = finetune(preset="paper")        # A100 / 40 GB  Appendix A verbatim
+#
+# # To start from TabICLv2, switch the prior with it -- everything else (d_model,
+# # class count, module paths) is read from the checkpoint:
+# cfg = FinetuneConfig(**{**PRESETS["medium"].__dict__,
+#                         "checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"})
+# finetune(cfg)
 #
 # # Watch the [val] lines, not the step lines: every step draws a fresh random
 # # synthetic problem, so train loss reflects that draw rather than progress.

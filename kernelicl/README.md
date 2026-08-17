@@ -175,6 +175,30 @@ of context outcomes get the queries right. Across thousands of unrelated problem
 produces a representation where nearest-neighbour voting works in general. Your own
 data is never involved.
 
+### Starting from TabICLv2
+
+`checkpoint` alone is not the whole change. `d_model` (512 in both), the class count
+and every module path are read from the checkpoint, so the model side needs nothing.
+But the two were pretrained on **different priors**, and `prior_type` should follow:
+
+| | checkpoint | prior_type |
+|---|---|---|
+| paper / v1 | `tabicl-classifier-v1-20250208.ckpt` | `mlp_scm` — Appendix A's "random MLP functions" |
+| v2 | `tabicl-classifier-v2-20260212.ckpt` | `graph_scm` |
+
+```python
+cfg = FinetuneConfig(**{**PRESETS["medium"].__dict__,
+                        "checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"})
+```
+
+Their configs otherwise differ in ways that matter only inside TabICL: v1 has
+`col_feature_group=False` and `col_target_aware=False`, v2 has grouping on, target-aware
+column embedding, SSMax and non-interleaved RoPE. Both verified end to end here.
+
+Do not copy v2's stage-2/3 recipe (`max_seq_len` 10240/60000, `seq_len_per_gp=True`):
+those are its long-context stages, and `seq_len_per_gp` returns nested tensors the
+training loop here does not handle.
+
 | preset | GPU | for |
 |---|---|---|
 | `paper` | A100 / 40 GB | Appendix A verbatim, 5000 × 64 |
