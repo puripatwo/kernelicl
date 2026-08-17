@@ -155,6 +155,18 @@ average record's influence cut recovery of seeded bad labels from 41/60 to 5/60.
 Ranking by error *share* rather than raw weight-on-errors doubled recovery again
 (21/30 vs 10/30, chance 2.6).
 
+**Prior generation, not the GPU, is the bottleneck.** Synthetic batches are built on
+CPU while the GPU trains. At Appendix A settings one batch of 8 datasets takes ~0.7s
+single-threaded — about 6s per step, over **8 hours** across 5000 steps, with the GPU
+idle for nearly all of it. And `PriorDataset`'s own process pool cannot be used:
+`HpSampler` returns sampled hyperparameters as *closures*, which `multiprocessing`
+cannot pickle, so the pool dies with `AttributeError: Can't get local object`.
+
+The fix is threads, not processes. Most of the work is numpy and torch, which release
+the GIL, so a prefetcher with 8 threads measured ~5x — 1.5h of generation, overlapped
+with training rather than blocking it. Each thread needs its **own** `PriorDataset`,
+because `HpSampler` stores draws on the instance with `setattr`.
+
 **Chunked queries do not help at typical scale.** Measured at n=11,690 / m=2,923: the
 unchunked ICL stage costs ~650 MB and chunking is *worse*, because the 12-block K/V
 cache (~570 MB) outweighs the activations it replaces. It pays off only when queries

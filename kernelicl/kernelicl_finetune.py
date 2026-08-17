@@ -61,7 +61,10 @@ class FinetuneConfig:
     max_seq_len: int = 1024
     min_train_size: float = 0.6
     max_train_size: float = 0.8
-    prior_n_jobs: int = -1
+    prior_threads: int = 0
+    """Background threads generating synthetic batches; 0 picks from the CPU count.
+    Generation is the usual bottleneck -- at Appendix A settings it is ~6s per step
+    single-threaded, so the GPU would idle through most of a long run."""
 
     # Optimisation.
     steps: int = 5000
@@ -246,39 +249,90 @@ def _forward_batch(model, head, batch, cfg, device, num_classes):
     return loss, n_used, accuracy, perplexity
 
 
-def _make_prior(cfg):
-    """A prior dataset, with the worker count probed rather than assumed.
+def _build_prior(cfg):
+    """One prior dataset. ``n_jobs=1``: its own process pool cannot be used here.
 
-    Some hyperparameter samplers build unpicklable closures, and the failure
-    surfaces from inside a worker pool. Probing turns that into a setup warning.
+    ``PriorDataset`` dispatches datasets within a batch through
+    ``multiprocessing.Pool.map``, which must pickle the sampled hyperparameters. Those
+    values are closures returned by ``HpSampler``, so the pool dies with an
+    ``AttributeError`` about a local object. Parallelism comes from threads instead --
+    see :class:`_BatchPrefetcher`.
     """
     from tabicl.prior import PriorDataset
 
-    def build(n_jobs):
-        return PriorDataset(
-            regression=False,
-            prior_type=cfg.prior_type,
-            batch_size=cfg.micro_batch,
-            min_features=cfg.min_features,
-            max_features=cfg.max_features,
-            max_seq_len=cfg.max_seq_len,
-            min_train_size=cfg.min_train_size,
-            max_train_size=cfg.max_train_size,
-            n_jobs=n_jobs,
-            device="cpu",
-        )
+    return PriorDataset(
+        regression=False,
+        prior_type=cfg.prior_type,
+        batch_size=cfg.micro_batch,
+        min_features=cfg.min_features,
+        max_features=cfg.max_features,
+        max_seq_len=cfg.max_seq_len,
+        min_train_size=cfg.min_train_size,
+        max_train_size=cfg.max_train_size,
+        n_jobs=1,
+        device="cpu",
+    )
 
-    if cfg.prior_n_jobs in (0, 1):
-        return build(1)
 
-    prior = build(cfg.prior_n_jobs)
-    try:
-        prior.get_batch()
-        return prior
-    except Exception as exc:
-        print(f"! parallel prior generation failed ({type(exc).__name__}: {str(exc)[:80]}); "
-              f"falling back to one worker. Generation may now bottleneck the GPU.")
-        return build(1)
+class _BatchPrefetcher:
+    """Generates prior batches on background threads, overlapping them with training.
+
+    Synthetic data is built on the CPU while the GPU trains, so generation throughput
+    sets the floor on step time. At Appendix A settings one batch of 8 datasets takes
+    about 0.7s single-threaded, which is ~6s of generation per step and over eight
+    hours across 5000 steps -- with the GPU idle for nearly all of it.
+
+    Threads rather than processes, because the prior's hyperparameters are closures
+    that ``multiprocessing`` cannot pickle. Most of the work is numpy and torch, which
+    release the GIL, so threading still recovers roughly 4x with 8 threads.
+
+    Each thread owns its own ``PriorDataset``: ``HpSampler`` stores sampled
+    hyperparameters on the instance with ``setattr``, so sharing one across threads
+    would race.
+    """
+
+    def __init__(self, cfg, n_threads: int):
+        import queue
+        import threading
+
+        self._queue = queue.Queue(maxsize=max(2 * n_threads, 4))
+        self._stop = threading.Event()
+        self._error = None
+        self._queue_module = queue
+        self._threads = [
+            threading.Thread(target=self._work, args=(_build_prior(cfg),), daemon=True)
+            for _ in range(n_threads)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _work(self, prior):
+        while not self._stop.is_set():
+            try:
+                batch = prior.get_batch()
+            except BaseException as exc:  # surface it on the consumer's next call
+                self._error = exc
+                self._stop.set()
+                return
+            while not self._stop.is_set():
+                try:
+                    self._queue.put(batch, timeout=0.5)
+                    break
+                except self._queue_module.Full:
+                    continue
+
+    def get_batch(self):
+        while True:
+            try:
+                return self._queue.get(timeout=1.0)
+            except self._queue_module.Empty:
+                if self._error is not None:
+                    raise RuntimeError("prior generation failed") from self._error
+                if not any(t.is_alive() for t in self._threads):
+                    raise RuntimeError("all prior generation threads have stopped")
+
+    def close(self):
+        self._stop.set()
 
 
 @torch.no_grad()
@@ -353,8 +407,10 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     amp_dtype = torch.bfloat16 if amp_on and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on and amp_dtype is torch.float16)
 
-    prior = _make_prior(cfg)
-    print(f"generating {cfg.val_batches} validation batches...")
+    n_threads = cfg.prior_threads or min(8, os.cpu_count() or 1)
+    prior = _BatchPrefetcher(cfg, n_threads)
+    print(f"generating {cfg.val_batches} validation batches "
+          f"on {n_threads} thread{'s' if n_threads > 1 else ''}...")
     val_batches = [prior.get_batch() for _ in range(cfg.val_batches)]
 
     accum = max(cfg.batch_size // cfg.micro_batch, 1)
@@ -365,6 +421,19 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
           f"= effective batch {accum * cfg.micro_batch}\n")
 
     history = {"step": [], "loss": [], "val": []}
+    try:
+        _train_loop(cfg, model, head, prior, val_batches, optimizer, scheduler, scaler,
+                    backbone_params + head_params, amp_on, amp_dtype, accum, device,
+                    num_classes, model_config, d_model, history)
+    finally:
+        prior.close()
+    return history
+
+
+def _train_loop(cfg, model, head, prior, val_batches, optimizer, scheduler, scaler,
+                params, amp_on, amp_dtype, accum, device, num_classes, model_config,
+                d_model, history):
+    """The step loop, split out so the prefetcher can be closed on any exit path."""
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
 
@@ -388,7 +457,7 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
             continue
 
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(backbone_params + head_params, cfg.grad_clip)
+        torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -420,7 +489,6 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
         print("\nno validation checkpoint was taken; nothing saved")
     else:
         print(f"\nbest checkpoint at {cfg.out_path} (validation loss {best_val:.4f})")
-    return history
 
 
 def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, KernelHead]:
@@ -448,7 +516,7 @@ def smoke_test(device: Optional[str] = None) -> None:
     cfg = FinetuneConfig(
         steps=2, batch_size=2, micro_batch=1, max_seq_len=128, max_features=8,
         min_features=4, val_batches=1, val_every=1, warmup_steps=1, log_every=1,
-        amp=False, prior_n_jobs=1, device=device, out_path="/tmp/kicl_smoke.pt",
+        amp=False, prior_threads=1, device=device, out_path="/tmp/kicl_smoke.pt",
     )
     history = finetune(cfg)
     assert history["loss"], "no optimiser step completed"
