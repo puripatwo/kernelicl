@@ -511,18 +511,21 @@ plt.show()
 # prose rather than a verified match.
 
 # %%
-def compactness(neighbour_idx):
-    """Mean per-feature distance from each test point to its neighbours, normalized."""
+def compactness_sd(neighbour_idx):
+    """Mean gap between a case and its neighbours, per feature, in standard deviations."""
     diff = np.abs(Xtr_s[neighbour_idx] - Xte_s[:, None, :])  # (m, k, F)
-    per_feature = diff.mean(axis=(0, 1))
-    return per_feature / per_feature.mean()
+    return diff.mean(axis=(0, 1))
 
 
 _, _, w_knn = score("knn", COMPACTNESS_K)
 idx_kicl = w_knn[0].topk(COMPACTNESS_K, dim=-1).indices.cpu().numpy()
 idx_std = NearestNeighbors(n_neighbors=COMPACTNESS_K).fit(Xtr_s).kneighbors(Xte_s, return_distance=False)
 
-comp_kicl, comp_std = compactness(idx_kicl), compactness(idx_std)
+abs_kicl, abs_std = compactness_sd(idx_kicl), compactness_sd(idx_std)
+# Normalize each method by its own mean, following the paper. This is what makes the
+# two columns comparable -- and it is also what limits the claim: the columns measure
+# each method's *relative emphasis* across features, not absolute closeness.
+comp_kicl, comp_std = abs_kicl / abs_kicl.mean(), abs_std / abs_std.mean()
 rel_diff = (comp_std - comp_kicl) / comp_std
 
 names = FEATURE_NAMES if FEATURE_NAMES is not None else [f"feature {i}" for i in range(Xtr_num.shape[1])]
@@ -531,10 +534,23 @@ ranked = np.argsort(-rel_diff)
 TOP = min(12, len(ranked) // 2)
 show = np.concatenate([ranked[:TOP], ranked[-TOP:]])
 
-print(f"neighbourhood compactness, k={COMPACTNESS_K} (normalized by method mean)\n")
-print(f"{'feature':>28} {'standard':>10} {'KernelICL':>11} {'rel.diff':>10}")
+# The overall level, which the normalized columns deliberately hide. Expect
+# KernelICL's neighbourhoods to be WIDER in raw feature space: it selects on the
+# learned embedding, not on raw distance, so it trades absolute closeness for
+# closeness on whatever it considers diagnostic. Read the table as "which features
+# does each method prioritise", never as "whose neighbours match better".
+print(f"neighbourhood compactness, k={COMPACTNESS_K}\n")
+print(f"overall gap to neighbours (mean over features, in SDs): "
+      f"plain kNN {abs_std.mean():.3f}, KernelICL {abs_kicl.mean():.3f} "
+      f"({abs_kicl.mean() / abs_std.mean():.2f}x)")
+print(f"KernelICL is absolutely looser on {100 * (abs_kicl > abs_std).mean():.0f}% of features; "
+      f"the columns below are normalized within each method, so they show relative")
+print(f"emphasis rather than absolute closeness.\n")
+print(f"{'feature':>26} {'standard':>9} {'KernelICL':>10} {'rel.diff':>9} "
+      f"{'std_SD':>8} {'kicl_SD':>8}")
 for i in show:
-    print(f"{names[i][:28]:>28} {comp_std[i]:>10.2f} {comp_kicl[i]:>11.2f} {100*rel_diff[i]:>9.0f}%")
+    print(f"{names[i][:26]:>26} {comp_std[i]:>9.2f} {comp_kicl[i]:>10.2f} "
+          f"{100*rel_diff[i]:>8.0f}% {abs_std[i]:>8.3f} {abs_kicl[i]:>8.3f}")
 
 # %%
 fig, ax = plt.subplots(figsize=(7.2, 0.28 * len(show) + 1.4))
