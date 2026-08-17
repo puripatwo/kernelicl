@@ -12,6 +12,7 @@ See README.md for what the presets trade away and how to tell a run is working.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,11 @@ class FinetuneConfig:
     val_batches: int = 32
     val_every: int = 250
     out_path: str = "kernelicl_finetuned.pt"
+    """Written atomically every time validation improves, not only at the end, so an
+    interrupted run keeps its best checkpoint. Point this at mounted Drive on Colab."""
+    resume_from: Optional[str] = None
+    """Continue from a local checkpoint instead of a pretrained one. A warm restart:
+    optimiser state and the schedule are not saved, so both begin again."""
     seed: int = 0
     device: Optional[str] = None
     log_every: int = 25
@@ -114,6 +120,53 @@ def load_pretrained(checkpoint: str, device: str) -> tuple[TabICL, dict]:
     model = TabICL(**payload["config"])
     model.load_state_dict(payload["state_dict"])
     return model.to(device), payload["config"]
+
+
+def _starting_point(cfg, device):
+    """(model, model_config, head_state) to begin from.
+
+    ``resume_from`` continues from a local checkpoint instead of a pretrained one.
+    It is a warm restart, not an exact resume: optimiser state and the learning-rate
+    schedule are not saved, so both begin again. Useful when a long run is cut short.
+    """
+    if not cfg.resume_from:
+        model, model_config = load_pretrained(cfg.checkpoint, device)
+        return model, model_config, None
+
+    payload = torch.load(cfg.resume_from, map_location="cpu", weights_only=False)
+    model = TabICL(**payload["config"])
+    model.load_state_dict(payload["state_dict"])
+    print(f"resuming from {cfg.resume_from} (validation loss "
+          f"{payload.get('val_loss', float('nan')):.4f}); optimiser state restarts")
+    return model.to(device), payload["config"], payload.get("kernel_head")
+
+
+def _save_checkpoint(path: str, model, head, model_config: dict, d_model: int,
+                     cfg, val_loss: float) -> None:
+    """Write the checkpoint atomically.
+
+    Written to a temporary file and renamed, so an interrupted write cannot leave a
+    truncated checkpoint where a good one used to be -- the difference between losing
+    the last validation interval and losing the whole run, especially on a network
+    filesystem like a mounted Drive.
+
+    ``kernel_head.*`` is excluded from the backbone dict: attaching the head registers
+    it as a submodule, and including it would make the dict unloadable by a plain
+    ``TabICL(**config)``.
+    """
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save({
+        "config": model_config,
+        "state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                       if not k.startswith("kernel_head.")},
+        "kernel_head": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
+        "head_config": {"d_model": d_model, "d_k": cfg.d_k, "kernel": cfg.kernel},
+        "val_loss": val_loss,
+        "finetune_config": cfg.__dict__,
+    }, temporary)
+    os.replace(temporary, destination)
 
 
 def trainable_parameters(model: TabICL, head: nn.Module) -> tuple[list, list]:
@@ -271,11 +324,13 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    model, model_config = load_pretrained(cfg.checkpoint, device)
+    model, model_config, head_state = _starting_point(cfg, device)
     num_classes = model.max_classes
     d_model = model.embed_dim * model.row_num_cls
     head = KernelHead(d_model=d_model, d_k=cfg.d_k, kernel=cfg.kernel,
                       identity_init=(cfg.d_k == d_model)).to(device)
+    if head_state is not None:
+        head.load_state_dict(head_state)
     model.kernel_head = head
     set_recompute(model, cfg.recompute)
     model.train()
@@ -310,7 +365,7 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
           f"= effective batch {accum * cfg.micro_batch}\n")
 
     history = {"step": [], "loss": [], "val": []}
-    best_val, best_state = float("inf"), None
+    best_val, saved_any = float("inf"), False
     started = time.perf_counter()
 
     for step in range(cfg.steps):
@@ -354,32 +409,17 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
             improved = metrics["loss"] < best_val
             if improved:
                 best_val = metrics["loss"]
-                # Excluding kernel_head.* keeps the backbone dict loadable by a plain
-                # TabICL(**config): attaching the head registers it as a submodule.
-                best_state = {
-                    "model": {k: v.detach().cpu().clone()
-                              for k, v in model.state_dict().items()
-                              if not k.startswith("kernel_head.")},
-                    "head": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
-                }
+                _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
+                                 cfg, best_val)
+                saved_any = True
             print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
                   f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
-                  f"{'  <- best' if improved else ''}")
+                  f"{'  <- best, saved' if improved else ''}")
 
-    if best_state is None:
+    if not saved_any:
         print("\nno validation checkpoint was taken; nothing saved")
-        return history
-
-    Path(cfg.out_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "config": model_config,
-        "state_dict": best_state["model"],
-        "kernel_head": best_state["head"],
-        "head_config": {"d_model": d_model, "d_k": cfg.d_k, "kernel": cfg.kernel},
-        "val_loss": best_val,
-        "finetune_config": cfg.__dict__,
-    }, cfg.out_path)
-    print(f"\nsaved {cfg.out_path} (validation loss {best_val:.4f})")
+    else:
+        print(f"\nbest checkpoint at {cfg.out_path} (validation loss {best_val:.4f})")
     return history
 
 
@@ -421,26 +461,42 @@ def smoke_test(device: Optional[str] = None) -> None:
 # --------------------------------------------------------------------------- #
 # Usage
 # --------------------------------------------------------------------------- #
-# smoke_test()                              # ~1 min, do this first
+# smoke_test()                              # do this first; seconds on a GPU
 #
-# history = finetune(preset="small")        # T4 / 16 GB    ~30 min, a sanity run
+# # The full Appendix A run, saved where a disconnect cannot take it. The best
+# # checkpoint is rewritten atomically every time validation improves, so an
+# # interrupted run keeps whatever it had reached.
+# from google.colab import drive
+# drive.mount("/content/drive")
+#
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
+#                         "out_path": "/content/drive/MyDrive/kernelicl/paper.pt"})
+# history = finetune(cfg)
+#
+# # If the session dies, continue from what was saved. A warm restart: optimiser
+# # state and the schedule are not stored, so both begin again.
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__, "steps": 2000,
+#                         "resume_from": "/content/drive/MyDrive/kernelicl/paper.pt",
+#                         "out_path": "/content/drive/MyDrive/kernelicl/paper2.pt"})
+# finetune(cfg)
+#
+# # Smaller runs, if you want to check the loss moves before committing hours:
+# history = finetune(preset="small")        # T4 / 16 GB    ~30 min
 # history = finetune(preset="medium")       # 24 GB         a few hours
-# history = finetune(preset="paper")        # A100 / 40 GB  Appendix A verbatim
 #
 # # To start from TabICLv2, switch the prior with it -- everything else (d_model,
 # # class count, module paths) is read from the checkpoint:
-# cfg = FinetuneConfig(**{**PRESETS["medium"].__dict__,
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
 #                         "checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"})
-# finetune(cfg)
 #
 # # Watch the [val] lines, not the step lines: every step draws a fresh random
 # # synthetic problem, so train loss reflects that draw rather than progress.
+# # history is only for plotting that curve; the checkpoint is already on disk.
+# import matplotlib.pyplot as plt
+# v = history["val"]
+# plt.plot([d["step"] for d in v], [d["loss"] for d in v], marker="o")
+# plt.xlabel("step"); plt.ylabel("validation loss"); plt.show()
 #
 # # Then everything downstream uses it, with the scale recalibrated:
-# ex = fit_explainer(X_train, y_train, X_test, finetuned="kernelicl_finetuned.pt")
-#
-# # Save somewhere that survives a disconnect:
-# from google.colab import drive; drive.mount("/content/drive")
-# cfg = FinetuneConfig(**{**PRESETS["medium"].__dict__,
-#                         "out_path": "/content/drive/MyDrive/kicl_ft.pt"})
-# finetune(cfg)
+# ex = fit_explainer(X_train, y_train, X_test,
+#                    finetuned="/content/drive/MyDrive/kernelicl/paper.pt")

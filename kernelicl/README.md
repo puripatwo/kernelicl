@@ -205,8 +205,14 @@ training loop here does not handle.
 | `medium` | 24 GB | a real run |
 | `small` | T4 / 16 GB | does the loss move at all |
 
-Run `smoke_test()` first — two steps on tiny batches, about a minute, and it caught
-two real bugs during development.
+Run `smoke_test()` first — two steps on tiny batches, and it caught three real bugs
+during development.
+
+The best checkpoint is rewritten **every time validation improves**, atomically (temp
+file then rename), so an interrupted run keeps whatever it reached and a half-written
+file cannot replace a good one. Point `out_path` at mounted Drive on Colab. If a
+session dies, `resume_from` continues from the saved checkpoint — a warm restart,
+since optimiser state and the schedule are not stored.
 
 Three details that matter:
 
