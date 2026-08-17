@@ -242,11 +242,22 @@ Do not copy v2's stage-2/3 recipe (`max_seq_len` 10240/60000, `seq_len_per_gp=Tr
 those are its long-context stages, and `seq_len_per_gp` returns nested tensors the
 training loop here does not handle.
 
-| preset | GPU | for |
-|---|---|---|
-| `paper` | A100 / 40 GB | Appendix A verbatim, 5000 × 64 |
-| `medium` | 24 GB | a real run |
-| `small` | T4 / 16 GB | does the loss move at all |
+| preset | for |
+|---|---|
+| `paper` | Appendix A verbatim, 5000 steps × 64 datasets |
+| `medium` | a real run, shorter sequences and fewer features |
+| `small` | does the loss move at all |
+
+Presets describe how much training to do, **not how to chunk it**. `micro_batch` and
+`recompute` are probed against the actual GPU with real forward and backward passes at
+the worst case the prior can produce, so the same preset adapts to the card.
+
+That probe exists because guessing it is expensive. An early version fixed
+`micro_batch=2` and `recompute=True` in the small preset so it would fit a 16 GB card;
+on a 40 GB A100 that meant eight sequential forward/backward passes per step on two
+datasets each, with every forward recomputed for the backward. The tensors at these
+sizes are small enough that the GPU is latency-bound, so unnecessary accumulation
+multiplies per-pass overhead with nothing to show for it.
 
 Run `smoke_test()` first — two steps on tiny batches, and it caught three real bugs
 during development.

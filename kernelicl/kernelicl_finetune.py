@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -72,9 +72,12 @@ class FinetuneConfig:
 
     # Optimisation.
     steps: int = 5000
-    micro_batch: int = 8
+    micro_batch: int = 0
     """Datasets per forward pass; gradients accumulate to reach batch_size, so peak
-    memory tracks this rather than the effective batch."""
+    memory tracks this rather than the effective batch. 0 probes the largest that fits
+    on this GPU. Chunking smaller than necessary is expensive: each micro-batch is a
+    separate forward and backward, and at these tensor sizes the GPU is latency-bound,
+    so eight small passes cost far more than one large one."""
     lr_backbone: float = 1e-5
     lr_head: float = 1e-3
     """Separate rates: the backbone is pretrained and needs nudging, the head starts
@@ -85,9 +88,10 @@ class FinetuneConfig:
 
     # Memory.
     amp: bool = True
-    recompute: bool = False
-    """Gradient checkpointing. The first dial to turn on OOM: symmetric mode runs
-    2n+m query positions through the ICL transformer and keeps them all for backward."""
+    recompute: Optional[bool] = None
+    """Gradient checkpointing: trades ~20% extra compute for much less activation
+    memory. None enables it only if the smallest micro-batch would not otherwise fit,
+    so a large GPU never pays for it."""
 
     # Validation and output.
     val_batches: int = 32
@@ -112,13 +116,14 @@ V2_CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 V1 = {"checkpoint": V1_CHECKPOINT, "prior_type": "mlp_scm"}
 V2 = {"checkpoint": V2_CHECKPOINT, "prior_type": "graph_scm"}
 
+# Presets describe how much training to do, not how to chunk it: micro_batch and
+# recompute are probed against the actual GPU, so the same preset adapts to the card.
 PRESETS = {
     "paper": FinetuneConfig(),
-    "medium": FinetuneConfig(steps=2000, micro_batch=4, max_seq_len=768, max_features=60,
-                             val_batches=8, val_every=200, recompute=True),
-    "small": FinetuneConfig(steps=500, batch_size=16, micro_batch=2, max_seq_len=512,
-                            max_features=40, val_batches=4, val_every=100,
-                            warmup_steps=50, recompute=True),
+    "medium": FinetuneConfig(steps=2000, max_seq_len=768, max_features=60,
+                             val_batches=8, val_every=200),
+    "small": FinetuneConfig(steps=500, batch_size=16, max_seq_len=512, max_features=40,
+                            val_batches=4, val_every=100, warmup_steps=50),
 }
 
 
@@ -181,6 +186,57 @@ def _save_checkpoint(path: str, model, head, model_config: dict, d_model: int,
         "finetune_config": cfg.__dict__,
     }, temporary)
     os.replace(temporary, destination)
+
+
+def autotune_chunking(cfg, model, head, device, num_classes) -> tuple[int, bool]:
+    """Largest micro-batch that fits, and whether checkpointing is needed for it.
+
+    Probed with real forward and backward passes at the worst case the prior can
+    produce -- longest sequence, most features -- rather than estimated. Guessing this
+    is how a run ends up eight times slower than it needs to be: the tensors here are
+    small enough that the GPU is latency-bound, so unnecessary accumulation multiplies
+    per-pass overhead with nothing to show for it.
+    """
+    if cfg.micro_batch and cfg.recompute is not None:
+        return cfg.micro_batch, cfg.recompute
+
+    on_cuda = device == "cuda"
+    train_size = max(int(cfg.max_seq_len * cfg.max_train_size), 1)
+    # Off GPU there is no memory wall to find, so probe a small ceiling: the point is
+    # only to exercise the same path, cheaply.
+    ceiling = cfg.batch_size if on_cuda else min(2, cfg.batch_size)
+    candidates = ([cfg.micro_batch] if cfg.micro_batch
+                  else [b for b in (64, 32, 16, 8, 4, 2, 1) if b <= ceiling])
+
+    def fits(size: int, recompute: bool) -> bool:
+        set_recompute(model, recompute)
+        try:
+            X = torch.randn(size, cfg.max_seq_len, cfg.max_features, device=device)
+            y = torch.randint(0, max(num_classes, 2), (size, train_size),
+                              device=device).float()
+            with torch.autocast(device_type=device, enabled=cfg.amp and on_cuda):
+                probs, _ = model.forward_kernel(X, y, kernel_head=head,
+                                                num_classes=num_classes, gamma=cfg.gamma)
+                targets = y[:, :1].expand(size, probs.shape[1]).reshape(size, -1)
+                loss, used = kernel_loss(probs, targets)
+            if loss is not None and used:
+                loss.backward()
+            return True
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            return False
+        finally:
+            model.zero_grad(set_to_none=True)
+            head.zero_grad(set_to_none=True)
+            if on_cuda:
+                torch.cuda.empty_cache()
+
+    for recompute in ((False, True) if cfg.recompute is None else (bool(cfg.recompute),)):
+        for size in candidates:
+            if fits(size, recompute):
+                return size, recompute
+    return 1, True
 
 
 def trainable_parameters(model: TabICL, head: nn.Module) -> tuple[list, list]:
@@ -405,8 +461,14 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     if head_state is not None:
         head.load_state_dict(head_state)
     model.kernel_head = head
-    set_recompute(model, cfg.recompute)
     model.train()
+
+    micro_batch, recompute = autotune_chunking(cfg, model, head, device, num_classes)
+    if (micro_batch, recompute) != (cfg.micro_batch, cfg.recompute):
+        print(f"chunking probed on this device: micro_batch={micro_batch}, "
+              f"recompute={recompute}")
+    cfg = replace(cfg, micro_batch=micro_batch, recompute=recompute)
+    set_recompute(model, cfg.recompute)
 
     backbone_params, head_params = trainable_parameters(model, head)
     optimizer = torch.optim.AdamW(
