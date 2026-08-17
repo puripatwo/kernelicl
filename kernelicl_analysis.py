@@ -40,6 +40,13 @@ K_GRID = [1, 4, 5, 16, 32, 64, 128, 256, 512, 1024]
 KERNELS = ("gaussian", "dot", "knn")
 COMPACTNESS_K = 5  # neighbourhood size for T3/F4, following the paper's Pima study
 
+# "accuracy" reproduces the paper, whose TALENT datasets are roughly balanced.
+# For screening it is the wrong choice: a model that refers nobody scores well when
+# positives are rare. "balanced_accuracy" averages recall over classes, so missing
+# the rare class is penalised properly. This choice feeds the *calibration* too, so
+# it changes which kernel scale gets selected, not just the number reported.
+METRIC = "balanced_accuracy"  # "accuracy" | "balanced_accuracy"
+
 # X may be a DataFrame with string/categorical columns and NaNs. y is coerced to a
 # plain array because weights are indexed positionally against training rows, and a
 # Series with a non-default index would silently do label lookup instead.
@@ -80,6 +87,17 @@ plt.rcParams.update({
     "axes.spines.top": False, "axes.spines.right": False,
     "legend.frameon": False, "figure.dpi": 130,
 })
+
+
+def evaluate(y_true, y_pred) -> float:
+    """The headline metric, chosen by METRIC."""
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score
+
+    if METRIC == "accuracy":
+        return float(accuracy_score(y_true, y_pred))
+    if METRIC == "balanced_accuracy":
+        return float(balanced_accuracy_score(y_true, y_pred))
+    raise ValueError(f"unknown METRIC {METRIC!r}")
 
 
 def tidy(ax, title=None, xlabel=None, ylabel=None):
@@ -153,7 +171,7 @@ def score(kernel, scale, E_tr=E_train, E_te=E_test, y_ctx=y_t, truth=None):
         probs, w = head(E_tr, E_te, y_ctx, num_classes=n_classes, gamma=scale)
     pred = clf.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
     truth = y_test if truth is None else truth
-    return (pred == truth).mean(), relative_perplexity(w).mean().item(), w
+    return evaluate(truth, pred), relative_perplexity(w).mean().item(), w
 
 
 # %% [markdown]
@@ -183,7 +201,7 @@ def calibrate():
             with torch.no_grad():
                 probs, w = cal_head(E_ca_tr, E_ca_va, y_ca, num_classes=n_classes, gamma=scale)
             pred = cal.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
-            rows.append((scale, (pred == yb).mean(), relative_perplexity(w).mean().item()))
+            rows.append((scale, evaluate(yb, pred), relative_perplexity(w).mean().item()))
         curves[kernel] = rows
         chosen[kernel] = max(rows, key=lambda r: (round(r[1], 3), -r[2]))[0]
     return chosen, curves
@@ -201,7 +219,10 @@ print("calibrated scales:", BEST)
 
 # %%
 print(f"embedding pass: {EMBED_SECONDS:.2f}s (shared by every row below)\n")
-print(f"{'kernel':>10} {'scale':>8} {'test acc':>10} {'rel.PPL%':>10} {'kernel ms':>11}")
+print("scale direction: for gaussian/dot it is gamma, where LARGER means sharper and")
+print("therefore FEWER effective neighbours; for knn it is k itself, where larger means")
+print("MORE. The two run in opposite directions -- read rel.PPL%, not the scale.\n")
+print(f"{'kernel':>10} {'scale':>8} {METRIC[:10]:>12} {'rel.PPL%':>10} {'kernel ms':>11}")
 T1 = []
 for kernel in KERNELS:
     for scale in (K_GRID if kernel == "knn" else GAMMA_GRID):
@@ -210,7 +231,7 @@ for kernel in KERNELS:
         ms = (time.perf_counter() - t0) * 1000
         T1.append(dict(kernel=kernel, scale=scale, acc=acc, ppl=ppl, ms=ms))
         star = " *" if scale == BEST[kernel] else ""
-        print(f"{kernel:>10} {scale:>8} {acc:>10.4f} {100*ppl:>10.2f} {ms:>11.1f}{star}")
+        print(f"{kernel:>10} {scale:>8} {acc:>12.4f} {100*ppl:>10.2f} {ms:>11.1f}{star}")
 print("\n* = scale selected on the validation split")
 
 # %% [markdown]
@@ -231,11 +252,11 @@ clf_ens = make_clf(n_estimators=8, single_norm=False)
 clf_ens.fit(X_train, y_train)
 
 t0 = time.perf_counter()
-acc_ens = (clf_ens.predict(X_test) == y_test).mean()
+acc_ens = evaluate(y_test, clf_ens.predict(X_test))
 t_ens = time.perf_counter() - t0
 
 t0 = time.perf_counter()
-acc_single = (clf.predict(X_test) == y_test).mean()
+acc_single = evaluate(y_test, clf.predict(X_test))
 t_single = time.perf_counter() - t0
 
 T2 = [
@@ -251,15 +272,15 @@ for kernel in KERNELS:
         probs, w = head(E_tr2, E_te2, y2, num_classes=n_classes, gamma=BEST[kernel])
     elapsed = time.perf_counter() - t0
     pred = clf.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
-    T2.append((LABEL[kernel], (pred == y_test).mean(), relative_perplexity(w).mean().item(), elapsed))
+    T2.append((LABEL[kernel], evaluate(y_test, pred), relative_perplexity(w).mean().item(), elapsed))
     del E_tr2, E_te2
 
-print(f"{'method':>24} {'accuracy':>10} {'rel.PPL%':>10} {'time (s)':>10}")
+print(f"{'method':>24} {METRIC[:10]:>12} {'rel.PPL%':>10} {'time (s)':>10}")
 for name, acc, ppl, secs in T2:
     a = f"{acc:.4f}" if acc is not None else "—"
     p = f"{100*ppl:.2f}" if ppl is not None else "—"
     s = f"{secs:.1f}" if secs is not None else "—"
-    print(f"{name:>24} {a:>10} {p:>10} {s:>10}")
+    print(f"{name:>24} {a:>12} {p:>10} {s:>10}")
 print("\nTabICL-MLP: identical to TabICL (single) until the model is fine-tuned.")
 
 # %% [markdown]
@@ -287,13 +308,13 @@ mu, sd = Xtr_num.mean(0), Xtr_num.std(0)
 sd = np.where(sd == 0, 1.0, sd)
 Xtr_s, Xte_s = (Xtr_num - mu) / sd, (Xte_num - mu) / sd
 
-print(f"{'k':>6} {'rel.PPL%':>10} {'KernelICL':>11} {'std kNN':>10} {'delta pp':>10}")
+print(f"{'k':>6} {'rel.PPL%':>10} {'KernelICL':>11} {'std kNN':>10} {'delta pp':>10}   ({METRIC})")
 T4 = []
 for k in K_GRID:
     if k > len(X_train):
         continue
     acc_kicl, ppl, _ = score("knn", k)
-    acc_std = (KNeighborsClassifier(n_neighbors=k).fit(Xtr_s, y_train).predict(Xte_s) == y_test).mean()
+    acc_std = evaluate(y_test, KNeighborsClassifier(n_neighbors=k).fit(Xtr_s, y_train).predict(Xte_s))
     T4.append(dict(k=k, ppl=ppl, kicl=acc_kicl, std=acc_std))
     print(f"{k:>6} {100*ppl:>10.2f} {acc_kicl:>11.4f} {acc_std:>10.4f} {100*(acc_kicl-acc_std):>10.2f}")
 
@@ -341,9 +362,9 @@ if spread < 0.005:
 ax.set_xscale("log")
 ax.set_xticks([0.1, 1, 10, 100])
 ax.set_xticklabels(["0.1", "1", "10", "100"])
-tidy(ax, "Accuracy against inspectability", "relative perplexity (%, log scale) — lower is more inspectable",
-     "test accuracy")
-ax.legend(loc="lower right", fontsize=9)
+tidy(ax, f"{METRIC.replace('_', ' ').capitalize()} against inspectability", "relative perplexity (%, log scale) — lower is more inspectable",
+     f"test {METRIC.replace('_', ' ')}")
+ax.legend(loc="center right", fontsize=9)
 plt.tight_layout()
 plt.show()
 
@@ -357,19 +378,36 @@ plt.show()
 # %%
 with torch.no_grad():
     H_train = head.embed(E_train)[0].cpu().numpy()
+    H_test = head.embed(E_test)[0].cpu().numpy()
 
+# Fit on the training cases, then transform the test cases into that same space.
+# Figure 2 marks the test point with a red cross, and without it you cannot see
+# whether the heavy dots are anywhere near the case being decided.
+#
+# Fit on training only, not on both. There is a systematic offset between the two
+# sets: a training row appears in the context, so its query finds a perfect match
+# to itself among the keys, while a test row never does. Fitting the projection on
+# the union lets that offset dominate the layout, pushing every test point into
+# empty space. It is also why training-internal nearest-neighbour distances are a
+# biased reference for novelty (see kernelicl_clinical). The offset does not affect
+# the weights, which always compare test queries against training keys.
 try:
     from umap import UMAP
-    proj = UMAP(n_components=2, random_state=SEED).fit_transform(H_train)
+    _reducer = UMAP(n_components=2, random_state=SEED).fit(H_train)
     PROJ_NAME = "UMAP"
 except ImportError:
     from sklearn.decomposition import PCA
-    proj = PCA(n_components=2, random_state=SEED).fit_transform(H_train)
+    # svd_solver="full" rather than the default: for 2 components out of 512 the
+    # default picks randomized SVD, which emitted spurious overflow warnings on
+    # well-conditioned input during testing.
+    _reducer = PCA(n_components=2, svd_solver="full").fit(H_train.astype(np.float64))
     PROJ_NAME = "PCA"
     print("umap-learn not installed; using PCA. `!pip install umap-learn` for the paper's layout.")
 
+proj = np.asarray(_reducer.transform(H_train.astype(np.float64)))
+proj_test = np.asarray(_reducer.transform(H_test.astype(np.float64)))
 order = np.argsort(proj[:, 0])  # training samples sorted along the first component
-print(f"{PROJ_NAME} projection: {proj.shape}")
+print(f"{PROJ_NAME} projection: train {proj.shape}, test {proj_test.shape}")
 
 # %% [markdown]
 # ## Pick test points to inspect
@@ -387,11 +425,48 @@ with torch.no_grad():
 pred_g = clf.y_encoder_.inverse_transform(probs_g.argmax(-1)[0].cpu().numpy())
 
 row_ppl = relative_perplexity(w_g).numpy()
-errors = np.flatnonzero(pred_g != y_test)
+
+# Two extremes of the evidence spectrum, then one error in each direction. Errors
+# are NOT interchangeable in screening: a missed positive and an unnecessary
+# referral have very different costs, and an earlier version of this cell picked
+# whichever error happened to be most concentrated, so which of the two you saw was
+# luck. The rarer training class is treated as "positive", which is the screening
+# convention -- override POSITIVE below if that is not true of your labels.
+_cls, _cnt = np.unique(y_train, return_counts=True)
+POSITIVE = _cls[_cnt.argmin()]
+
+# Within each direction, take the *most concentrated* error: a confidently wrong
+# prediction built on few cases is far more diagnostic than a hedged one, because
+# you can name the handful of records that misled it.
+missed = np.flatnonzero((y_test == POSITIVE) & (pred_g != POSITIVE))
+false_alarm = np.flatnonzero((y_test != POSITIVE) & (pred_g == POSITIVE))
+
 PICKS = [int(row_ppl.argmin()), int(row_ppl.argmax())]
-PICKS.append(int(errors[np.argmin(row_ppl[errors])]) if len(errors) else int(np.argsort(row_ppl)[len(row_ppl) // 2]))
-PICK_TAGS = ["most concentrated", "most diffuse", "misclassified" if len(errors) else "median"]
-print("inspecting test rows:", dict(zip(PICK_TAGS, PICKS)))
+PICK_TAGS = ["most concentrated", "most diffuse"]
+if len(missed):
+    PICKS.append(int(missed[np.argmin(row_ppl[missed])]))
+    PICK_TAGS.append(f"missed {POSITIVE} (false negative)")
+if len(false_alarm):
+    PICKS.append(int(false_alarm[np.argmin(row_ppl[false_alarm])]))
+    PICK_TAGS.append(f"false {POSITIVE} (false positive)")
+if len(PICKS) == 2:
+    PICKS.append(int(np.argsort(row_ppl)[len(row_ppl) // 2]))
+    PICK_TAGS.append("median (no errors to show)")
+
+# The same row can satisfy two descriptions -- the most concentrated prediction is
+# often also an error. Keep the first label for each row rather than drawing it twice.
+_seen, _p, _t = set(), [], []
+for idx, tag in zip(PICKS, PICK_TAGS):
+    if idx not in _seen:
+        _seen.add(idx)
+        _p.append(idx)
+        _t.append(tag)
+PICKS, PICK_TAGS = _p, _t
+
+print(f"positive class = {POSITIVE} (rarer in training) | "
+      f"{len(missed)} missed, {len(false_alarm)} false alarms")
+for idx, tag in zip(PICKS, PICK_TAGS):
+    print(f"  test row {idx:>5}  {tag}")
 
 # %% [markdown]
 # ## F3 — where each prediction's evidence sits
@@ -519,6 +594,17 @@ def class_style(c):
 # honestly that no single row carries much.
 SIZE_MAX = float(w_g[PICKS].max())
 
+
+def _limits(v, margin=0.06):
+    lo, hi = float(v.min()), float(v.max())
+    pad = (hi - lo) * margin or 1.0
+    return lo - pad, hi + pad
+
+
+# Frame the panels on the training cloud, so an out-of-distribution test case cannot
+# rescale the plot and hide the structure everything else is read against.
+XLIM, YLIM = _limits(proj[:, 0]), _limits(proj[:, 1])
+
 fig, axes = plt.subplots(1, len(PICKS), figsize=(3.8 * len(PICKS), 4.0), sharex=True, sharey=True)
 for ax, idx, tag in zip(np.atleast_1d(axes), PICKS, PICK_TAGS):
     wt = w_g[idx].numpy()
@@ -530,6 +616,21 @@ for ax, idx, tag in zip(np.atleast_1d(axes), PICKS, PICK_TAGS):
             ax.scatter(proj[sel, 0], proj[sel, 1], s=8 + 260 * wt[sel] / SIZE_MAX,
                        color=class_style(c)[0], alpha=0.7, linewidths=0.5,
                        edgecolors=SURFACE, zorder=2)
+    # The case being decided, in the same space. Figure 2 uses a red cross; a dark
+    # cross with a light halo keeps the categorical palette free for the classes.
+    # A test case can land outside the training cloud entirely -- which is worth
+    # seeing, but letting one point rescale the axes would squash the cloud into a
+    # corner. So clamp it to the frame and say that is what happened.
+    tx, ty = proj_test[idx]
+    inside = (XLIM[0] <= tx <= XLIM[1]) and (YLIM[0] <= ty <= YLIM[1])
+    ax.scatter(np.clip(tx, *XLIM), np.clip(ty, *YLIM), marker="X", s=150,
+               color=INK if inside else SURFACE, edgecolors=INK,
+               linewidths=1.5, zorder=3)
+    if not inside:
+        ax.text(0.5, 0.02, "case sits outside the training cloud", transform=ax.transAxes,
+                ha="center", fontsize=8, color=INK_2, style="italic")
+    ax.set_xlim(*XLIM)
+    ax.set_ylim(*YLIM)
     ax.set_title(f"test row {idx}\n{tag} · rel. PPL {100*row_ppl[idx]:.1f}%\n"
                  f"true {y_test[idx]} / pred {pred_g[idx]}",
                  color=INK_2, fontsize=9, loc="left")
@@ -545,6 +646,7 @@ for c in range(n_classes):
         seen.add(label)
         handles.append(Line2D([], [], marker="o", linestyle="", markersize=7, color=color, label=label))
 handles.append(Line2D([], [], marker="o", linestyle="", markersize=4, color=GRID, label="negligible weight"))
+handles.append(Line2D([], [], marker="X", linestyle="", markersize=9, color=INK, label="the case being decided"))
 fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
            bbox_to_anchor=(0.5, -0.02))
 fig.suptitle(f"Training samples in {PROJ_NAME} space, sized by contribution", color=INK,
