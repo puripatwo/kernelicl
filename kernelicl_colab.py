@@ -40,7 +40,14 @@ print("classes:", np.unique(y_train))
 # best case.
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-QUERY_CHUNK = 2048  # bounds peak memory; exact, not an approximation
+
+# Leave this at None. Chunking caches the context K/V and streams queries against
+# it, which only pays off when queries vastly outnumber context rows. At your
+# shape (n=11690, m=2923) the cache costs more than it saves -- measured at
+# 12 blocks x 2 x n x 512 floats = ~570 MB of cache versus ~650 MB for the whole
+# unchunked pass. Set it to e.g. 2048 only if you later score a very large test
+# set against a small context.
+QUERY_CHUNK = None
 print("device:", DEVICE)
 
 # %% [markdown]
@@ -275,18 +282,23 @@ print(f"\nper-prediction relative perplexity (gaussian): "
 # ## Notes for your scale
 #
 # **Memory.** Symmetric mode issues `2*11690 + 2923 = 26,303` queries against
-# 11,690 keys. `query_chunk_size` caches the context K/V once and streams query
-# chunks against it, so peak memory tracks the chunk, not the query count. It is
-# exact — the ICL transformer has no positional encoding and scales its softmax
-# by the key count, so queries are mutually independent. Drop `QUERY_CHUNK` to
-# 512 if you still OOM on a T4.
+# 11,690 keys, roughly doubling the ICL transformer's cost versus stock TabICL.
+# Measured on CPU at exactly your shape, the ICL stage costs ~650 MB — not a
+# problem on any GPU. The heavy stages are column embedding and row interaction
+# over 14,613 rows x 176 features, and `forward_kernel` routes those through
+# TabICL's own `InferenceManager` via `inference_config`, exactly as the stock
+# forward does. So you inherit TabICL's memory management for free.
+#
+# `query_chunk_size` exists for the opposite regime (huge test set, small
+# context). At your shape it is counterproductive: the cached K/V for 12 blocks
+# is ~570 MB, more than the unchunked pass it replaces. Hence `QUERY_CHUNK=None`.
 #
 # The weight matrix itself is `2923 x 11690` floats ≈ 137 MB. Fine on GPU, but
 # section 5 moves it to CPU because you will be slicing it repeatedly.
 #
-# **The slow part** is column embedding over 14,613 rows x 176 features, not the
-# kernel. Section 3 embeds once and sweeps the whole grid over cached embeddings,
-# which is why calibration is cheap here and expensive in the paper's Table 3.
+# **The slow part** is column embedding, not the kernel. Section 3 embeds once
+# and sweeps the whole grid over cached embeddings, which is why calibration is
+# cheap here and expensive in the paper's Table 3.
 #
 # **If the chosen gamma lands at the top of the grid**, extend it upward. With
 # `W = I` the useful range sits well above the paper's Table 7 grid, which was
