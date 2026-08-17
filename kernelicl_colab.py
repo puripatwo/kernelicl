@@ -31,8 +31,20 @@ from tabicl._model.kernel_head import KernelHead, relative_perplexity
 # Expected inputs, already in memory:
 #   X_train (11690, 176)   y_train (11690,)
 #   X_test   (2923, 176)   y_test   (2923,)
+#
+# X may be a DataFrame with string/categorical columns and NaNs -- TabICL handles
+# all three. y is coerced to a plain array because everything below indexes it
+# positionally (weight index i -> training row i), and a pandas Series with a
+# non-default index would silently do label lookup instead and return wrong rows.
+y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
+y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
+
 print("X_train", X_train.shape, "| X_test", X_test.shape)
-print("classes:", np.unique(y_train))
+classes, counts = np.unique(y_train, return_counts=True)
+print("classes:", dict(zip(classes, counts)))
+if counts.min() / counts.max() < 0.2:
+    print("! imbalanced -- accuracy below will flatter the majority class; "
+          "consider balanced accuracy or per-class recall instead.")
 
 # 176 features is outside the 5-100 range the synthetic prior was trained on.
 # TabICL handles it (the TALENT benchmark goes to 970 features), but it is
@@ -74,7 +86,10 @@ clf = TabICLClassifier(
 )
 clf.fit(X_train, y_train)
 
-data = clf.ensemble_generator_.transform(X_test, mode="both")
+# The ensemble generator runs *after* TabICL's numeric encoder, so it must be fed
+# encoded input -- this is exactly what `predict_proba` does internally. Passing
+# raw X works for all-numeric arrays and raises on string or categorical columns.
+data = clf.ensemble_generator_.transform(clf.X_encoder_.transform(X_test), mode="both")
 norm_method = next(iter(data))
 X_ens, y_ens = data[norm_method]  # (1, n+m, H), (1, n)
 
@@ -162,7 +177,8 @@ cal = TabICLClassifier(
     class_shuffle_method="none", device=DEVICE, random_state=0, kv_cache=False,
 )
 cal.fit(Xa, ya)
-Xc_ens, yc_ens = next(iter(cal.ensemble_generator_.transform(Xb, mode="both").values()))
+Xc_ens, yc_ens = next(iter(cal.ensemble_generator_.transform(
+    cal.X_encoder_.transform(Xb), mode="both").values()))
 Xc = torch.from_numpy(np.asarray(Xc_ens)).float().to(DEVICE)
 yc = torch.from_numpy(np.asarray(yc_ens)).float().to(DEVICE)
 

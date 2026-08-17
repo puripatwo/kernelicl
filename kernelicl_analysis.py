@@ -40,10 +40,18 @@ K_GRID = [1, 4, 5, 16, 32, 64, 128, 256, 512, 1024]
 KERNELS = ("gaussian", "dot", "knn")
 COMPACTNESS_K = 5  # neighbourhood size for T3/F4, following the paper's Pima study
 
-# Optional: names for your 176 columns, used to label T3/F4.
-FEATURE_NAMES = None  # e.g. list(df.drop(columns="target").columns)
+# X may be a DataFrame with string/categorical columns and NaNs. y is coerced to a
+# plain array because weights are indexed positionally against training rows, and a
+# Series with a non-default index would silently do label lookup instead.
+FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
+y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
+y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
 
 print(f"device={DEVICE} | train {X_train.shape} | test {X_test.shape}")
+_cls, _cnt = np.unique(y_train, return_counts=True)
+print("classes:", dict(zip(_cls, _cnt)))
+if _cnt.min() / _cnt.max() < 0.2:
+    print("! imbalanced -- accuracy in T1/T2/T4 will flatter the majority class.")
 
 # %% [markdown]
 # ## Plot style
@@ -104,8 +112,14 @@ def make_clf(n_estimators=1, single_norm=True):
 
 
 def embed(fitted_clf, X_query):
-    """Symmetric in-context embeddings for a fitted classifier and a query set."""
-    X_ens, y_ens = next(iter(fitted_clf.ensemble_generator_.transform(X_query, mode="both").values()))
+    """Symmetric in-context embeddings for a fitted classifier and a query set.
+
+    The ensemble generator sits *after* TabICL's numeric encoder, so the query has
+    to be encoded first -- this mirrors what `predict_proba` does internally.
+    Passing raw X works for all-numeric arrays and raises on string columns.
+    """
+    encoded = fitted_clf.X_encoder_.transform(X_query)
+    X_ens, y_ens = next(iter(fitted_clf.ensemble_generator_.transform(encoded, mode="both").values()))
     X_t = torch.from_numpy(np.asarray(X_ens)).float().to(DEVICE)
     y_t = torch.from_numpy(np.asarray(y_ens)).float().to(DEVICE)
     m = fitted_clf.model_
@@ -257,9 +271,21 @@ print("\nTabICL-MLP: identical to TabICL (single) until the model is fine-tuned.
 # *which* neighbours get chosen — input-space Euclidean versus learned embedding.
 
 # %%
-mu, sd = X_train.mean(0), X_train.std(0)
+# The input-space baseline needs a purely numeric, NaN-free matrix, which raw X
+# may not be. Reuse TabICL's own numeric encoder so string and categorical columns
+# map the same way they do for the model, then median-impute -- sklearn's kNN
+# cannot handle NaN, though TabICL itself can. Imputation touches only this
+# baseline, never the KernelICL path.
+Xtr_num = np.asarray(clf.X_encoder_.transform(X_train), dtype=float)
+Xte_num = np.asarray(clf.X_encoder_.transform(X_test), dtype=float)
+med = np.nanmedian(Xtr_num, axis=0)
+med = np.where(np.isnan(med), 0.0, med)
+Xtr_num = np.where(np.isnan(Xtr_num), med, Xtr_num)
+Xte_num = np.where(np.isnan(Xte_num), med, Xte_num)
+
+mu, sd = Xtr_num.mean(0), Xtr_num.std(0)
 sd = np.where(sd == 0, 1.0, sd)
-Xtr_s, Xte_s = (X_train - mu) / sd, (X_test - mu) / sd
+Xtr_s, Xte_s = (Xtr_num - mu) / sd, (Xte_num - mu) / sd
 
 print(f"{'k':>6} {'rel.PPL%':>10} {'KernelICL':>11} {'std kNN':>10} {'delta pp':>10}")
 T4 = []
@@ -424,7 +450,8 @@ idx_std = NearestNeighbors(n_neighbors=COMPACTNESS_K).fit(Xtr_s).kneighbors(Xte_
 comp_kicl, comp_std = compactness(idx_kicl), compactness(idx_std)
 rel_diff = (comp_std - comp_kicl) / comp_std
 
-names = FEATURE_NAMES if FEATURE_NAMES is not None else [f"feature {i}" for i in range(X_train.shape[1])]
+names = FEATURE_NAMES if FEATURE_NAMES is not None else [f"feature {i}" for i in range(Xtr_num.shape[1])]
+names = [str(n) for n in names]
 ranked = np.argsort(-rel_diff)
 TOP = min(12, len(ranked) // 2)
 show = np.concatenate([ranked[:TOP], ranked[-TOP:]])
@@ -461,7 +488,25 @@ plt.show()
 
 # %%
 y_train_enc = clf.y_encoder_.transform(y_train)
-class_colors = [C_BLUE, C_ORANGE]
+
+# A scatter needs every pair of hues distinguishable, not just adjacent ones, and
+# only the first three slots of the palette clear that gate. Beyond three classes,
+# the rest fold into one neutral "other" rather than inventing a fourth hue --
+# generating extra hues is what makes a chart unreadable under colorblindness.
+PALETTE_CAP = 3
+class_colors = [C_BLUE, C_ORANGE, C_AQUA][:min(n_classes, PALETTE_CAP)]
+C_OTHER = "#8a8984"
+if n_classes > PALETTE_CAP:
+    print(f"{n_classes} classes: showing the {PALETTE_CAP} most frequent separately, "
+          f"the rest as 'other'. Facet by class if you need all of them.")
+    keep = list(np.argsort(-np.bincount(y_train_enc, minlength=n_classes))[:PALETTE_CAP])
+else:
+    keep = list(range(n_classes))
+
+
+def class_style(c):
+    """(color, label) for an encoded class index."""
+    return (class_colors[keep.index(c)], f"class {clf.classes_[c]}") if c in keep else (C_OTHER, "other classes")
 
 # Two separate decisions, deliberately not conflated:
 #   * which rows to color -- per panel, since "did this prediction use row i" is a
@@ -479,11 +524,11 @@ for ax, idx, tag in zip(np.atleast_1d(axes), PICKS, PICK_TAGS):
     wt = w_g[idx].numpy()
     heavy = wt > wt.max() * 0.02
     ax.scatter(proj[~heavy, 0], proj[~heavy, 1], s=3, color=GRID, linewidths=0, zorder=1)
-    for c in range(min(n_classes, len(class_colors))):
+    for c in range(n_classes):
         sel = heavy & (y_train_enc == c)
         if sel.any():
             ax.scatter(proj[sel, 0], proj[sel, 1], s=8 + 260 * wt[sel] / SIZE_MAX,
-                       color=class_colors[c], alpha=0.7, linewidths=0.5,
+                       color=class_style(c)[0], alpha=0.7, linewidths=0.5,
                        edgecolors=SURFACE, zorder=2)
     ax.set_title(f"test row {idx}\n{tag} · rel. PPL {100*row_ppl[idx]:.1f}%\n"
                  f"true {y_test[idx]} / pred {pred_g[idx]}",
@@ -493,8 +538,12 @@ for ax, idx, tag in zip(np.atleast_1d(axes), PICKS, PICK_TAGS):
     for side in ax.spines.values():
         side.set_visible(False)
 
-handles = [Line2D([], [], marker="o", linestyle="", markersize=7, color=class_colors[c],
-                  label=f"class {clf.classes_[c]}") for c in range(min(n_classes, len(class_colors)))]
+seen, handles = set(), []
+for c in range(n_classes):
+    color, label = class_style(c)
+    if label not in seen:
+        seen.add(label)
+        handles.append(Line2D([], [], marker="o", linestyle="", markersize=7, color=color, label=label))
 handles.append(Line2D([], [], marker="o", linestyle="", markersize=4, color=GRID, label="negligible weight"))
 fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
            bbox_to_anchor=(0.5, -0.02))
