@@ -163,9 +163,21 @@ idle for nearly all of it. And `PriorDataset`'s own process pool cannot be used:
 cannot pickle, so the pool dies with `AttributeError: Can't get local object`.
 
 The fix is threads, not processes. Most of the work is numpy and torch, which release
-the GIL, so a prefetcher with 8 threads measured ~5x — 1.5h of generation, overlapped
-with training rather than blocking it. Each thread needs its **own** `PriorDataset`,
-because `HpSampler` stores draws on the instance with `setattr`.
+the GIL. Each thread needs its **own** `PriorDataset`, because `HpSampler` stores
+draws on the instance with `setattr`.
+
+**But more threads is not simply better, and the first version of this was too
+greedy.** Producers hold the GIL to build each dataset, and the main thread needs it
+to dispatch CUDA kernels, so past a handful of producers the GPU starves and the run
+can end up *slower* than generating inline. Producers also each ran torch CPU ops at
+torch's default intra-op thread count, asking for `threads x cores` of them; the
+prior's own process pool set that to 1 in its workers, and the prefetcher now does the
+same.
+
+Do not guess the thread count. `benchmark_prior()` measures generation alone on your
+machine, and the training log reports **`wait %`**, the share of each step spent
+blocked on data — that is the real signal. High: raise `prior_threads`. Near zero:
+you are GPU-bound and raising it only takes the GIL from CUDA dispatch.
 
 **Chunked queries do not help at typical scale.** Measured at n=11,690 / m=2,923: the
 unchunked ICL stage costs ~650 MB and chunking is *worse*, because the 12-block K/V

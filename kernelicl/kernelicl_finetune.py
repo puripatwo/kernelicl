@@ -26,7 +26,8 @@ from torch import nn
 from tabicl._model.kernel_head import KernelHead, relative_perplexity
 from tabicl._model.tabicl import TabICL
 
-__all__ = ["FinetuneConfig", "PRESETS", "finetune", "load_finetuned", "smoke_test"]
+__all__ = ["FinetuneConfig", "PRESETS", "benchmark_prior", "finetune",
+           "load_finetuned", "smoke_test"]
 
 
 # --------------------------------------------------------------------------- #
@@ -62,9 +63,12 @@ class FinetuneConfig:
     min_train_size: float = 0.6
     max_train_size: float = 0.8
     prior_threads: int = 0
-    """Background threads generating synthetic batches; 0 picks from the CPU count.
-    Generation is the usual bottleneck -- at Appendix A settings it is ~6s per step
-    single-threaded, so the GPU would idle through most of a long run."""
+    """Background threads generating synthetic batches; 0 picks a conservative default
+    from the CPU count. More is not better: producer threads hold the GIL to build
+    each dataset, and the main thread needs it to dispatch CUDA kernels, so too many
+    can starve the GPU and end up slower than generating inline. The log reports the
+    share of each step spent waiting on data -- tune from that, or from
+    benchmark_prior(). 1 reproduces plain inline generation."""
 
     # Optimisation.
     steps: int = 5000
@@ -302,6 +306,13 @@ class _BatchPrefetcher:
         import queue
         import threading
 
+        # Each producer runs torch CPU ops, and torch defaults to one intra-op thread
+        # per core, so N producers would ask for N x cores of them. The prior's own
+        # process pool sets this to 1 in its workers for the same reason. Restored in
+        # close(); the main thread is on the GPU, so its CPU intra-op count is moot.
+        self._torch_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+
         self._queue = queue.Queue(maxsize=max(2 * n_threads, 4))
         self._stop = threading.Event()
         self._error = None
@@ -340,6 +351,7 @@ class _BatchPrefetcher:
 
     def close(self):
         self._stop.set()
+        torch.set_num_threads(self._torch_threads)
 
 
 @torch.no_grad()
@@ -414,7 +426,9 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     amp_dtype = torch.bfloat16 if amp_on and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on and amp_dtype is torch.float16)
 
-    n_threads = cfg.prior_threads or min(8, os.cpu_count() or 1)
+    # Conservative by default: past a handful of producers the GIL contention with
+    # the main thread's CUDA dispatch outweighs the extra generation throughput.
+    n_threads = cfg.prior_threads or max(1, min(4, (os.cpu_count() or 2) // 2))
     prior = _BatchPrefetcher(cfg, n_threads)
     print(f"generating {cfg.val_batches} validation batches "
           f"on {n_threads} thread{'s' if n_threads > 1 else ''}...")
@@ -437,9 +451,13 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
             optimizer.zero_grad(set_to_none=True)
             totals = np.zeros(3)  # loss, accuracy, perplexity
             n_micro = 0
+            wait_seconds = 0.0
+            step_started = time.perf_counter()
 
             for _ in range(accum):
+                waiting = time.perf_counter()
                 batch = prior.get_batch()
+                wait_seconds += time.perf_counter() - waiting
                 with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
                     loss, _n_used, accuracy, perplexity = _forward_batch(
                         model, head, batch, cfg, device, num_classes)
@@ -462,11 +480,15 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
             history["step"].append(step)
             history["loss"].append(mean_loss)
 
+            step_seconds = time.perf_counter() - step_started
             if step % cfg.log_every == 0 or step == cfg.steps - 1:
                 rate = (step + 1) / (time.perf_counter() - started)
+                # "wait" is the share of the step spent blocked on synthetic data. High
+                # means data-bound: raise prior_threads. Near zero means the GPU is the
+                # limit and more threads will only take the GIL from CUDA dispatch.
                 print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
                       f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
-                      f"{rate:.2f} step/s")
+                      f"{rate:.2f} step/s  wait {100 * wait_seconds / max(step_seconds, 1e-9):.0f}%")
 
             if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
                 metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
@@ -506,6 +528,39 @@ def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, Ker
     head.load_state_dict(payload["kernel_head"])
     model.kernel_head = head
     return model.to(device).eval(), head.to(device).eval()
+
+
+def benchmark_prior(cfg: Optional[FinetuneConfig] = None, preset: str = "paper",
+                    thread_counts=(1, 2, 4, 8), batches: int = 6) -> dict:
+    """Measure generation throughput at several thread counts, on this machine.
+
+    Generation speed depends on core count, and the best thread count is not the
+    largest -- producers hold the GIL that the main thread needs to dispatch CUDA
+    work. This measures generation alone, so treat the winner as an upper bound and
+    confirm with the ``wait`` percentage in the training log.
+    """
+    cfg = cfg or PRESETS[preset]
+    print(f"cpu_count={os.cpu_count()}  micro_batch={cfg.micro_batch}  "
+          f"max_seq_len={cfg.max_seq_len}  max_features={cfg.max_features}\n")
+    print(f"{'threads':>8} {'s/batch':>9} {'s/step':>8}   {'5000 steps':>11}")
+    results = {}
+    accum = max(cfg.batch_size // cfg.micro_batch, 1)
+    for n in thread_counts:
+        prefetcher = _BatchPrefetcher(cfg, n)
+        try:
+            prefetcher.get_batch()
+            begun = time.perf_counter()
+            for _ in range(batches):
+                prefetcher.get_batch()
+            per_batch = (time.perf_counter() - begun) / batches
+        finally:
+            prefetcher.close()
+        results[n] = per_batch
+        print(f"{n:>8} {per_batch:>9.2f} {per_batch * accum:>8.1f}   "
+              f"{per_batch * accum * cfg.steps / 3600:>10.1f}h")
+    best = min(results, key=results.get)
+    print(f"\nfastest at prior_threads={best}; the training log's wait% is the real test")
+    return results
 
 
 def smoke_test(device: Optional[str] = None) -> None:
