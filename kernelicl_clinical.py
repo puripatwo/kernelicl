@@ -12,23 +12,37 @@ so it is cheap and can be re-run with different thresholds interactively.
 
 Usage
 -----
-::
+Paste this whole file into a Colab cell (or ``%run -i kernelicl_clinical.py``),
+then one call does everything -- fits the model, calibrates the kernel scale on a
+held-out split, and calibrates the novelty threshold::
 
-    from kernelicl_clinical import ClinicalExplainer
-
-    ex = ClinicalExplainer(
-        clf, head, E_train, E_test, y_train,
-        kernel="gaussian", gamma=BEST["gaussian"],
-        train_ids=train_record_ids,      # optional, defaults to row numbers
-        test_ids=test_record_ids,
+    ex = fit_explainer(
+        X_train, y_train, X_test,
+        train_ids=patient_ids_train,     # optional; defaults to row numbers
+        test_ids=patient_ids_test,
     )
 
-    print(ex.case(0))                    # one case, as a readable card
     ex.triage()                          # every case, ranked by review priority
+    ex.triage_summary()                  # how the caseload splits
     ex.audit_labels(y_test)              # candidate mislabelled training records
-    ex.equity(train_site, test_site)     # evidence sources by subgroup
-    ex.feature_emphasis(X_tr_num, X_te_num, names)
-    ex.export("kernelicl_report")        # CSVs
+    ex.equity(site_train, site_test)     # evidence sources by subgroup
+    ex.feature_emphasis()                # what the model treats as "similar"
+    ex.export("report", y_test=y_test)   # CSVs for people without Python
+
+For the per-case cards a clinician reads, switch to the kNN kernel. It costs a
+matrix multiply, not another model run, and it is the difference between "these
+5 past cases account for the decision" and "the 5 most similar cases account for
+9% of it"::
+
+    cards = ex.with_kernel("knn", gamma=5)
+    print(cards.case(0))
+
+``y_test`` is needed only for the label audit and the CSV export -- prediction,
+triage, equity and feature emphasis never see it.
+
+If you already have a fitted classifier and embeddings (say from
+``kernelicl_analysis.py``), construct :class:`ClinicalExplainer` directly instead;
+``fit_explainer`` is only a convenience wrapper around it.
 
 Scope and limits
 ----------------
@@ -48,9 +62,16 @@ import numpy as np
 import pandas as pd
 import torch
 
-from tabicl._model.kernel_head import relative_perplexity, squared_distances
+from tabicl import TabICLClassifier
+from tabicl._model.kernel_head import KernelHead, relative_perplexity, squared_distances
 
-__all__ = ["ClinicalExplainer"]
+__all__ = ["ClinicalExplainer", "fit_explainer"]
+
+# Scale grids for calibration. Wider than the paper's Table 7 at the top end
+# because an untrained projection leaves the embeddings on a different scale, so
+# the useful range sits higher.
+GAMMA_GRID = [0.01, 0.05, 0.1, 0.3, 0.5, 0.8, 1.0, 1.5, 3.0, 5.0, 10.0]
+K_GRID = [1, 4, 5, 16, 32, 64, 128, 256, 512, 1024]
 
 _BAR = "█"
 
@@ -59,8 +80,197 @@ def _bar(share: float, width: int = 12) -> str:
     return (_BAR * int(round(share * width))).ljust(width, "·")
 
 
+def _as_array(a):
+    return (a.to_numpy() if hasattr(a, "to_numpy") else np.asarray(a)).ravel()
+
+
+def _embed(fitted_clf, X_query):
+    """Symmetric in-context embeddings for a fitted classifier and a query set.
+
+    The ensemble generator sits after TabICL's numeric encoder, so the query has
+    to be encoded first -- this mirrors what ``predict_proba`` does internally.
+    Passing raw X works for all-numeric arrays and raises on string columns.
+    """
+    encoded = fitted_clf.X_encoder_.transform(X_query)
+    X_ens, y_ens = next(iter(fitted_clf.ensemble_generator_.transform(encoded, mode="both").values()))
+    device = next(fitted_clf.model_.parameters()).device
+    X_t = torch.from_numpy(np.asarray(X_ens)).float().to(device)
+    y_t = torch.from_numpy(np.asarray(y_ens)).float().to(device)
+    m = fitted_clf.model_
+    with torch.no_grad():
+        R = m.row_interactor(
+            m.col_embedder(X_t, y_train=y_t, mgr_config=fitted_clf.inference_config_.COL_CONFIG),
+            mgr_config=fitted_clf.inference_config_.ROW_CONFIG,
+        )
+        return m.icl_predictor.embed(R, y_t, symmetric=True)
+
+
+def _make_clf(device, norm_method, random_state):
+    """One ensemble member, no shuffling -- so a weight index is a training row.
+
+    TabICL defaults to averaging 8 members over different normalizations and
+    feature/class shuffles. Averaging destroys the per-case attribution that this
+    whole module exists to provide, so it is switched off.
+    """
+    return TabICLClassifier(
+        n_estimators=1, norm_methods=[norm_method],
+        feat_shuffle_method="none", class_shuffle_method="none",
+        device=device, random_state=random_state, kv_cache=False,
+    )
+
+
+def fit_explainer(
+    X_train,
+    y_train,
+    X_test,
+    *,
+    kernel: str = "gaussian",
+    gamma: Optional[float] = None,
+    train_ids: Optional[Sequence] = None,
+    test_ids: Optional[Sequence] = None,
+    feature_names: Optional[Sequence] = None,
+    device: Optional[str] = None,
+    norm_method: str = "none",
+    calibrate: bool = True,
+    accuracy_tolerance: float = 0.01,
+    val_size: float = 0.2,
+    random_state: int = 0,
+    verbose: bool = True,
+    **explainer_kwargs,
+) -> "ClinicalExplainer":
+    """Fit everything from raw data and return a ready explainer.
+
+    Runs three things you would otherwise have to wire together: the TabICL
+    embedding, calibration of the kernel scale on a held-out split, and
+    calibration of the novelty threshold on that same split.
+
+    Parameters
+    ----------
+    X_train, y_train, X_test : array-like
+        Your data. ``X`` may be a DataFrame with string or categorical columns
+        and NaNs -- TabICL handles all three. ``y_test`` is deliberately not a
+        parameter: nothing here may see it.
+
+    kernel : {"gaussian", "dot", "knn"}, default="gaussian"
+        ``"gaussian"`` grades neighbours by similarity, so a case card can rank
+        them. ``"knn"`` weights its k selected cases equally, which reads as
+        "these exact k cases" -- cleaner to state, less informative to inspect,
+        and it cannot support the label audit because most records are never
+        selected at all.
+
+    gamma : float, optional
+        Kernel scale. Left as None it is calibrated on held-out data, which is
+        the right default: the scale controls how many past cases each prediction
+        draws on, and an uncalibrated one typically spreads weight over the whole
+        training set, giving predictions that are accurate but carry no usable
+        evidence.
+
+    calibrate : bool, default=True
+        Whether to hold out a split. Turning this off skips one embedding pass,
+        but then ``gamma`` must be supplied and the novelty flag falls back to a
+        cohort-relative reading rather than a training-range one.
+
+    accuracy_tolerance : float, default=0.01
+        How much held-out accuracy to trade for inspectability. Among scales
+        within this much of the best, the sparsest is chosen. This is the single
+        most consequential knob in the module: at 0.0 you get the most accurate
+        model, whose predictions typically average over the entire training set
+        and cannot be explained by any small set of past cases. At 0.01 you give
+        up at most one accuracy point and usually get an evidence base one or two
+        orders of magnitude smaller. Raise it if cards are still too diffuse to
+        read; set it to 0.0 if accuracy is all you care about, in which case you
+        probably do not need this module.
+
+    norm_method : str, default="none"
+        TabICL feature normalization: ``"none"``, ``"power"``, ``"quantile"``,
+        ``"quantile_rtdl"``, ``"robust"``. With many real-world features
+        ``"power"`` or ``"quantile"`` often matters more than the kernel choice;
+        it does not affect interpretability, since row identity is untouched.
+
+    Returns
+    -------
+    ClinicalExplainer
+    """
+    def say(msg):
+        if verbose:
+            print(msg)
+
+    y_train = _as_array(y_train)
+    if feature_names is None and hasattr(X_train, "columns"):
+        feature_names = list(X_train.columns)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not calibrate and gamma is None:
+        raise ValueError("gamma must be supplied when calibrate=False")
+
+    say(f"fitting on {len(y_train):,} training cases, scoring {len(X_test):,} "
+        f"(device={device}, kernel={kernel})")
+    clf = _make_clf(device, norm_method, random_state)
+    clf.fit(X_train, y_train)
+    d_model = clf.model_.icl_predictor.decoder[0].in_features
+    head = KernelHead(d_model=d_model, d_k=d_model, kernel=kernel, identity_init=True).to(device)
+
+    reference_distances = None
+    if calibrate:
+        from sklearn.model_selection import train_test_split
+
+        say("calibrating on a held-out split (one extra embedding pass)...")
+        strat = y_train if len(np.unique(y_train)) < len(y_train) // 2 else None
+        Xa, Xb, ya, yb = train_test_split(X_train, y_train, test_size=val_size,
+                                          random_state=random_state, stratify=strat)
+        cal = _make_clf(device, norm_method, random_state)
+        cal.fit(Xa, ya)
+        E_cal_train, E_cal_val = _embed(cal, Xb)
+        y_cal = torch.from_numpy(cal.y_encoder_.transform(_as_array(ya))).float().to(device)[None]
+
+        # The scale never touches the embedding, so the whole grid is swept over
+        # embeddings computed once. This is what makes calibration cheap.
+        if gamma is None:
+            rows = []
+            for scale in (K_GRID if kernel == "knn" else GAMMA_GRID):
+                with torch.no_grad():
+                    probs, w = head(E_cal_train, E_cal_val, y_cal,
+                                    num_classes=cal.n_classes_, gamma=scale)
+                pred = cal.y_encoder_.inverse_transform(probs.argmax(-1)[0].cpu().numpy())
+                rows.append((scale, float((pred == _as_array(yb)).mean()),
+                             float(relative_perplexity(w).mean())))
+            # Picking the most accurate scale is the wrong rule here. Accuracy is
+            # typically flat across much of the grid while the evidence base
+            # varies by orders of magnitude, so a plain argmax returns a kernel
+            # that averages over the whole training set -- accurate, and useless
+            # to a clinician, since no small set of past cases explains anything.
+            # Instead: among scales within `accuracy_tolerance` of the best, take
+            # the sparsest. This buys inspectability at a bounded, stated cost.
+            best_acc = max(r[1] for r in rows)
+            candidates = [r for r in rows if r[1] >= best_acc - accuracy_tolerance]
+            gamma, acc, ppl = min(candidates, key=lambda r: r[2])
+            n_ctx = len(ya)
+            say(f"  scale={gamma}  held-out accuracy={acc:.3f} "
+                f"(best on grid {best_acc:.3f}, gave up {best_acc - acc:.3f} "
+                f"within tolerance {accuracy_tolerance})")
+            say(f"  evidence base ≈ {ppl * n_ctx:.0f} of {n_ctx:,} cases per prediction")
+
+        reference_distances = ClinicalExplainer.reference_distances_from(head, E_cal_train, E_cal_val)
+        say(f"  novelty threshold calibrated on {len(reference_distances):,} held-out cases")
+
+    say("embedding the full training context...")
+    E_train, E_test = _embed(clf, X_test)
+
+    return ClinicalExplainer(
+        clf, head, E_train, E_test, y_train,
+        kernel=kernel, gamma=gamma,
+        train_ids=train_ids, test_ids=test_ids,
+        X_train=X_train, X_test=X_test, feature_names=feature_names,
+        reference_distances=reference_distances,
+        **explainer_kwargs,
+    )
+
+
 class ClinicalExplainer:
     """Turns a KernelICL weight matrix into clinician-usable outputs.
+
+    Most users should call :func:`fit_explainer` instead of constructing this
+    directly; it wires up the model, the calibration and the thresholds.
 
     Parameters
     ----------
@@ -132,12 +342,18 @@ class ClinicalExplainer:
         min_agreement: float = 0.80,
         reference_distances: Optional[np.ndarray] = None,
         novelty_quantile: float = 0.99,
+        X_train=None,
+        X_test=None,
+        feature_names: Optional[Sequence] = None,
     ):
         self.clf, self.head = clf, head
         self.kernel, self.gamma = kernel, gamma
         self.top_k, self.min_agreement = top_k, min_agreement
+        # Kept so feature_emphasis() can be called with no arguments.
+        self.X_train, self.X_test = X_train, X_test
+        self.feature_names = feature_names
 
-        self.y_train = np.asarray(y_train).ravel()
+        self.y_train = _as_array(y_train)
         self.n, self.m = E_train.shape[1], E_test.shape[1]
         self.train_ids = np.asarray(train_ids if train_ids is not None else np.arange(self.n))
         self.test_ids = np.asarray(test_ids if test_ids is not None else np.arange(self.m))
@@ -159,6 +375,11 @@ class ClinicalExplainer:
             self._novelty_label = "unusual compared with the rest of this cohort"
             ref = self._nn_test
         self.novelty_threshold = float(np.quantile(ref, novelty_quantile))
+        # Kept so with_kernel() can re-derive everything without re-running the
+        # model -- the embeddings are the expensive part, the kernel is a matmul.
+        self.E_train, self.E_test = E_train, E_test
+        self._reference_distances = reference_distances
+        self._novelty_quantile = novelty_quantile
         self.w = w[0].cpu().numpy()
         self.probs = probs[0].cpu().numpy()
         self.pred = clf.y_encoder_.inverse_transform(self.probs.argmax(-1))
@@ -169,6 +390,43 @@ class ClinicalExplainer:
         # "relative perplexity 0.05%" is not.
         self.evidence_cases = relative_perplexity(torch.from_numpy(self.w)).numpy() * self.n
         self.is_novel = self._nn_test > self.novelty_threshold
+
+    def with_kernel(self, kernel: str, gamma=None, **overrides) -> "ClinicalExplainer":
+        """The same fitted model and embeddings, read through a different kernel.
+
+        Costs a matrix multiply, not a model run, so switching is instant. Use it
+        because the two kernels are good at different jobs:
+
+        * ``"knn"`` for **case cards**. Every selected case carries equal weight
+          and together they account for all of the evidence, so a card reads
+          "these 5 past cases, 4 of which were referred" -- which is what a
+          clinician can actually check. A soft kernel often spreads weight so
+          thinly that the five most similar cases explain under 10% of the
+          decision, which is honest but unusable at the bedside.
+
+        * ``"gaussian"`` for **triage, label auditing and equity**. Graded weights
+          give a smooth agreement score rather than multiples of 1/k, and every
+          training record participates -- a sparse kernel never selects most
+          records, so they cannot be audited or attributed to a subgroup at all.
+
+        Example::
+
+            ex = fit_explainer(X_train, y_train, X_test)   # gaussian
+            cards = ex.with_kernel("knn", gamma=5)
+            print(cards.case(0))                           # legible card
+            ex.audit_labels(y_test)                        # soft weights
+        """
+        kwargs = dict(
+            kernel=kernel, gamma=gamma,
+            train_ids=self.train_ids, test_ids=self.test_ids,
+            top_k=self.top_k, min_agreement=self.min_agreement,
+            reference_distances=self._reference_distances,
+            novelty_quantile=self._novelty_quantile,
+            X_train=self.X_train, X_test=self.X_test, feature_names=self.feature_names,
+        )
+        kwargs.update(overrides)
+        return ClinicalExplainer(self.clf, self.head, self.E_train, self.E_test,
+                                 self.y_train, **kwargs)
 
     @staticmethod
     def reference_distances_from(head, E_ref_train: torch.Tensor, E_ref_holdout: torch.Tensor) -> np.ndarray:
@@ -398,7 +656,7 @@ class ClinicalExplainer:
     # ------------------------------------------------------------------ #
     # 6. Pre-deployment validation of the similarity metric
     # ------------------------------------------------------------------ #
-    def feature_emphasis(self, X_train_num, X_test_num, feature_names=None,
+    def feature_emphasis(self, X_train=None, X_test=None, feature_names=None,
                          k: Optional[int] = None) -> pd.DataFrame:
         """Which features the model insists comparable cases agree on.
 
@@ -409,12 +667,25 @@ class ClinicalExplainer:
         Take the top of this table to a clinician before deploying. Agreement
         with domain knowledge is independent evidence the model learned real
         structure rather than a site or device artifact.
+
+        Call with no arguments when the explainer came from :func:`fit_explainer`.
+        String and categorical columns are mapped through TabICL's own numeric
+        encoder, so they appear here on the same footing as numeric ones; NaNs are
+        median-imputed for the plain-distance baseline only, since sklearn's kNN
+        cannot take them although TabICL can.
         """
         from sklearn.neighbors import NearestNeighbors
 
         k = k or self.top_k
-        Xtr = np.asarray(X_train_num, dtype=float)
-        Xte = np.asarray(X_test_num, dtype=float)
+        X_train = self.X_train if X_train is None else X_train
+        X_test = self.X_test if X_test is None else X_test
+        if X_train is None or X_test is None:
+            raise ValueError("feature_emphasis needs X_train and X_test; pass them here, "
+                             "or build the explainer with fit_explainer() which keeps them.")
+        feature_names = feature_names if feature_names is not None else self.feature_names
+
+        Xtr = np.asarray(self.clf.X_encoder_.transform(X_train), dtype=float)
+        Xte = np.asarray(self.clf.X_encoder_.transform(X_test), dtype=float)
         med = np.nanmedian(Xtr, axis=0)
         med = np.where(np.isnan(med), 0.0, med)
         Xtr = np.where(np.isnan(Xtr), med, Xtr)
