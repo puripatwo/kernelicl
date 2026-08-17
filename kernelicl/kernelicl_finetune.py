@@ -390,11 +390,11 @@ def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, Ker
     return model.to(device).eval(), head.to(device).eval()
 
 
-def smoke_test(device: str = "cpu") -> None:
-    """Two optimiser steps on tiny batches. About a minute on CPU.
+def smoke_test(device: Optional[str] = None) -> None:
+    """Two optimiser steps on tiny batches, on the GPU if there is one.
 
-    Catches shape and dtype errors that would otherwise surface an hour into a
-    GPU run.
+    Catches shape, dtype and device errors that would otherwise surface an hour into
+    a real run. About a minute on CPU, seconds on a GPU.
     """
     cfg = FinetuneConfig(
         steps=2, batch_size=2, micro_batch=1, max_seq_len=128, max_features=8,

@@ -335,6 +335,27 @@ def test_forward_kernel_end_to_end():
 
 
 @torch.no_grad()
+def test_forward_kernel_defaults_inference_device_to_the_model(monkeypatch):
+    """A default InferenceConfig must not send inputs to a GPU the model is not on.
+
+    `device=None` makes the inference manager pick CUDA whenever a GPU is merely
+    present, then move inputs there, so a CPU-resident model failed with a device
+    mismatch on any GPU machine -- including a plain smoke test.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = make_tabicl()
+    model.kernel_head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    model.eval()
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+
+    probs, w = model.forward_kernel(X, y_train)
+
+    assert probs.shape == (1, N_TEST, 3)
+    torch.testing.assert_close(w.sum(-1), torch.ones(1, N_TEST))
+
+
+@torch.no_grad()
 def test_forward_kernel_requires_a_head():
     model = make_tabicl()
     X = torch.randn(1, N_TRAIN + N_TEST, 5)

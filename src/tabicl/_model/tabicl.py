@@ -621,7 +621,17 @@ class TabICL(nn.Module):
             )
         else:
             if inference_config is None:
+                # A default InferenceConfig leaves device=None, which the inference
+                # manager resolves to CUDA whenever a GPU is merely *present*. It then
+                # moves inputs there, so a CPU-resident model fails with a device
+                # mismatch on a GPU machine. Default to the model's own device.
                 inference_config = InferenceConfig()
+                own_device = next(self.parameters()).device
+                for mgr_config in (inference_config.COL_CONFIG,
+                                   inference_config.ROW_CONFIG,
+                                   inference_config.ICL_CONFIG):
+                    if mgr_config["device"] is None:
+                        mgr_config.update({"device": own_device})
             representations = self.row_interactor(
                 self.col_embedder(
                     X,
