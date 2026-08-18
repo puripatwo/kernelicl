@@ -26,7 +26,8 @@ from torch import nn
 from tabicl._model.kernel_head import KernelHead, relative_perplexity
 from tabicl._model.tabicl import TabICL
 
-__all__ = ["FinetuneConfig", "PRESETS", "finetune", "load_finetuned", "smoke_test"]
+__all__ = ["FinetuneConfig", "PRESETS", "benchmark_micro_batch", "finetune",
+           "load_finetuned", "smoke_test"]
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +74,9 @@ class FinetuneConfig:
     steps: int = 5000
     micro_batch: int = 8
     """Datasets per forward pass; gradients accumulate to reach batch_size, so peak
-    memory tracks this rather than the effective batch."""
+    memory tracks this rather than the effective batch. Once data generation is no
+    longer the bottleneck this is the main speed lever: raising it means fewer, larger
+    GPU launches for the same effective batch. Raise until it OOMs, then step back."""
     lr_backbone: float = 1e-5
     lr_head: float = 1e-3
     """Separate rates: the backbone is pretrained and needs nudging, the head starts
@@ -234,8 +237,8 @@ def _forward_batch(model, head, batch, cfg, device, num_classes):
     X, y, _d, seq_lens, train_sizes = batch
     # Datasets in a prior batch share a sequence length and split position.
     seq_len, train_size = int(seq_lens[0]), int(train_sizes[0])
-    X = X[:, :seq_len].to(device)
-    y = y[:, :seq_len].to(device)
+    X = X[:, :seq_len].to(device, non_blocking=True)
+    y = y[:, :seq_len].to(device, non_blocking=True)
     y_train, y_test = y[:, :train_size], y[:, train_size:]
     if y_test.shape[1] == 0:
         return None, 0, 0.0, 0.0
@@ -415,6 +418,7 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
     data_seconds = 0.0
+    last_log_time, last_log_step, last_log_data = started, -1, 0.0
 
     for step in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
@@ -450,12 +454,21 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
         history["loss"].append(mean_loss)
 
         if step % cfg.log_every == 0 or step == cfg.steps - 1:
-            elapsed = time.perf_counter() - started
-            rate = (step + 1) / elapsed
+            now = time.perf_counter()
+            # Rates over the window since the last log, not since the start: workers
+            # spin up over the first steps, so a cumulative average understates
+            # current throughput and inflates the projection.
+            window_seconds = now - last_log_time
+            window_steps = step - last_log_step
+            window_data = data_seconds - last_log_data
+            rate = window_steps / window_seconds if window_steps else 0.0
+            remaining = (cfg.steps - step - 1) / rate / 3600 if rate else float("inf")
             print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
                   f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
-                  f"{rate:.2f} step/s  ({100 * data_seconds / elapsed:.0f}% waiting on data, "
-                  f"{cfg.steps * elapsed / (step + 1) / 3600:.1f}h projected)")
+                  f"{rate:.2f} step/s  "
+                  f"({100 * window_data / window_seconds if window_seconds else 0:.0f}% "
+                  f"waiting on data, {remaining:.1f}h left)")
+            last_log_time, last_log_step, last_log_data = now, step, data_seconds
 
         if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
             metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
@@ -493,6 +506,84 @@ def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, Ker
     return model.to(device).eval(), head.to(device).eval()
 
 
+def benchmark_micro_batch(preset: str = "paper", candidates=(8, 16, 32),
+                          steps: int = 12, cfg: Optional[FinetuneConfig] = None) -> dict:
+    """Time a few steps at each micro_batch to find the fastest that fits.
+
+    Once generation is no longer the bottleneck, the effective batch is fixed and the
+    only remaining lever is how many datasets go through the GPU at once: larger
+    micro-batches mean fewer, bigger launches for the same work. How large fits
+    depends on the card, so measure rather than guess. Reports peak memory too, so a
+    setting can be rejected as too close to the limit before a long run relies on it.
+    """
+    base = cfg or PRESETS[preset]
+    device = base.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    results = {}
+
+    print(f"{'micro_batch':>12} {'accum':>6} {'step/s':>8} {'peak GB':>9}")
+    for micro in candidates:
+        if base.batch_size % micro:
+            continue
+        trial = FinetuneConfig(**{**base.__dict__, "micro_batch": micro, "steps": steps})
+        try:
+            if device == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            rate = _time_steps(trial, device, steps)
+            peak = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else float("nan")
+            results[micro] = rate
+            print(f"{micro:>12} {base.batch_size // micro:>6} {rate:>8.2f} {peak:>9.1f}")
+        except torch.cuda.OutOfMemoryError:
+            print(f"{micro:>12} {base.batch_size // micro:>6} {'OOM':>8}")
+            break
+        finally:
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+    if results:
+        best = max(results, key=results.get)
+        print(f"\nfastest: micro_batch={best} at {results[best]:.2f} step/s "
+              f"({base.steps / results[best] / 3600:.1f}h for {base.steps} steps)")
+    return results
+
+
+def _time_steps(cfg: FinetuneConfig, device: str, steps: int) -> float:
+    """Steps per second, timing only the second half so warm-up is excluded."""
+    model, _config, _head_state = _starting_point(cfg, device)
+    head = KernelHead(d_model=model.embed_dim * model.row_num_cls, d_k=cfg.d_k,
+                      kernel=cfg.kernel, identity_init=True).to(device)
+    model.kernel_head = head
+    set_recompute(model, cfg.recompute)
+    model.train()
+
+    backbone_params, head_params = trainable_parameters(model, head)
+    optimizer = torch.optim.AdamW([{"params": backbone_params, "lr": cfg.lr_backbone},
+                                   {"params": head_params, "lr": cfg.lr_head}])
+    amp_on = cfg.amp and device == "cuda"
+    amp_dtype = torch.bfloat16 if amp_on and torch.cuda.is_bf16_supported() else torch.float16
+    batches = _make_batches(cfg, device)
+    accum = max(cfg.batch_size // cfg.micro_batch, 1)
+
+    started = None
+    for step in range(steps):
+        if step == steps // 2:
+            if device == "cuda":
+                torch.cuda.synchronize()
+            started = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        for batch in _split_micro_batches(next(batches), cfg.micro_batch):
+            with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
+                loss, _n, _a, _p = _forward_batch(model, head, batch, cfg, device,
+                                                  model.max_classes)
+            if loss is not None:
+                (loss / accum).backward()
+        optimizer.step()
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    return (steps - steps // 2) / (time.perf_counter() - started)
+
+
 def smoke_test(device: Optional[str] = None) -> None:
     """Two optimiser steps on tiny batches, on the GPU if there is one.
 
@@ -517,10 +608,14 @@ def smoke_test(device: Optional[str] = None) -> None:
 # --------------------------------------------------------------------------- #
 # smoke_test()                              # do this first; seconds on a GPU
 #
-# # If the log says a large % is spent waiting on data, generation is the bottleneck,
-# # not the GPU. Raise workers and prefetch depth before touching anything else:
+# # Speed, in order. The log reports "% waiting on data" over the last window.
+# # If it is high, generation is the bottleneck -- add workers and prefetch depth:
 # cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
 #                         "prior_n_jobs": 12, "prefetch_factor": 4})
+#
+# # If it is near zero, the GPU is the bottleneck and micro_batch is the lever.
+# # Measure which size is fastest on your card rather than guessing:
+# benchmark_micro_batch(preset="paper", candidates=(8, 16, 32))
 #
 # # The full Appendix A run, saved where a disconnect cannot take it. The best
 # # checkpoint is rewritten atomically every time validation improves, so an

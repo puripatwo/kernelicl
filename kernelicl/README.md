@@ -214,11 +214,25 @@ file cannot replace a good one. Point `out_path` at mounted Drive on Colab. If a
 session dies, `resume_from` continues from the saved checkpoint — a warm restart,
 since optimiser state and the schedule are not stored.
 
-**If it is slow, look at the `% waiting on data` in the log first.** Synthetic batch
-generation runs on CPU and is usually the bottleneck, not the GPU. Batches are
-generated in background dataloader workers and prefetched, one batch per step split
-into micro-batches afterwards — mirroring TabICL's own trainer. Raise `prior_n_jobs`
-and `prefetch_factor` before reducing anything about the model.
+### If it is slow
+
+Every log line reports `% waiting on data` and hours remaining, both over the window
+since the last log rather than since the start — worker spin-up makes a cumulative
+average understate throughput badly in the first few hundred steps.
+
+1. **High `% waiting on data`** → generation is the bottleneck. Raise `prior_n_jobs`
+   and `prefetch_factor`. Batches are already built in background dataloader workers
+   and prefetched, one batch per step split into micro-batches afterwards, mirroring
+   TabICL's own trainer; before that they were generated inline with a fresh process
+   pool per micro-batch, which measured 0.05 step/s on an A100 against 0.21 after.
+2. **Near-zero `% waiting on data`** → the GPU is the bottleneck, and `micro_batch` is
+   the lever: fewer, larger launches for the same effective batch.
+   `benchmark_micro_batch()` times a few steps at each size and reports peak memory,
+   so you can pick the fastest that fits rather than guessing.
+3. **Only then** reduce `max_features` — column embedding cost scales with it, and it
+   is the largest deviation from Appendix A you can make for the smallest loss.
+
+`recompute=True` trades speed for memory, so leave it off unless you OOM.
 
 Three details that matter:
 
