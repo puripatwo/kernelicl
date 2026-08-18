@@ -60,6 +60,7 @@ Written to be pasted into Colab cells. Only one dependency between them.
 | `kernelicl_clinical.py` | **the core.** `fit_explainer` + `ClinicalExplainer` | — |
 | `kernelicl_analysis.py` | T1–T4, F1/F3/F4/F7 | clinical, data |
 | `kernelicl_embeddings.py` | T5, T6, E1–E4 | clinical, data |
+| `kernelicl_shift.py` | corruption testing: S1–S2, G1–G3 | clinical, data |
 | `kernelicl_finetune.py` | trains the embedding for the kernel | — |
 
 ### Setup
@@ -103,6 +104,9 @@ sits at its bottom, commented out.
 | **E2** | test cases over training, and error locations | extrapolation, and clustered failure |
 | **E3** | evidence base across the space | sanity check on the scale |
 | **E4** | feature gradients | cross-check on T3 |
+| **S1** | detection rate, clean vs corrupted | **did the model notice?** |
+| **S2** | how far the evidence moved | whether the feature was being used |
+| **G1–G3** | confidence vs unfamiliarity, paired shift, cohort movement | where silent failures sit |
 
 **T2 has a deliberate gap.** TabICL-MLP is reported as `-`: in the paper it is the
 same architecture fine-tuned with an MLP head, so without fine-tuning it is
@@ -116,6 +120,30 @@ it considers diagnostic. The output prints the absolute level alongside.
 **T1's scale column runs in opposite directions** for the two kernel families: for
 Gaussian and dot-product it is `γ`, where larger is sharper and gives *fewer*
 effective neighbours; for kNN it is `k` itself. Read `rel.PPL %`.
+
+## Corruption testing
+
+`kernelicl_shift.py` compares a clean test set against a corrupted one. The usual
+version of this test reports an accuracy drop, which tells you the model is sensitive
+but not whether it **knew**. Degrading from 96% to 81% while flagging most of the new
+errors is graceful; degrading identically while staying confident is dangerous,
+because in the field nobody catches the difference.
+
+So the headline is a 2×2 of correct/wrong against flagged/not-flagged:
+
+- **detection rate** — of the errors it made, what share did it flag. Holding up under
+  corruption means graceful degradation; collapsing means errors arrive unannounced.
+- **silent failures** — wrong, with no warning attached. The operational cost.
+- **evidence overlap@k** — how much of each case's evidence survived. Near 1.0 means
+  the corruption barely changed which past cases were consulted, so the model was not
+  relying on that feature; near 0 means it was.
+
+This is valid because **corrupting the test set cannot move the training embeddings**:
+column statistics attend to training rows only (`embed_with_test=False`) and the ICL
+keys are the training context, so the reference library is fixed and every difference
+is attributable to the corruption. `for_test_set()` asserts that invariant rather than
+trusting it, and carries `gamma` and the novelty threshold across unchanged —
+recalibrating on the corrupted set would change two things at once.
 
 ## Findings from building this
 

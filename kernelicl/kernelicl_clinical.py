@@ -407,6 +407,39 @@ class ClinicalExplainer:
         return ClinicalExplainer(self.clf, self.head, self.E_train, self.E_test,
                                  self.y_train, **kwargs)
 
+    def for_test_set(self, X_test, test_ids=None, **overrides) -> "ClinicalExplainer":
+        """Score a different set of cases against the same model, scale and thresholds.
+
+        Everything but the queries is held fixed -- the fitted classifier, the trained
+        head, the calibrated ``gamma``, and the novelty threshold. Recalibrating on the
+        new set would change two things at once and make the comparison
+        uninterpretable, which is the whole point when the new set is a corrupted copy
+        of the old one.
+
+        Only the queries are re-embedded. The training context cannot move: column
+        statistics attend to training rows only (``embed_with_test=False``) and the ICL
+        keys are the context, so the reference library is identical either way. That
+        invariant is asserted rather than assumed, since it is also what catches a
+        caller passing a frame with different columns.
+        """
+        E_train, E_test = _embed(self.clf, X_test)
+        if not torch.allclose(E_train, self.E_train, atol=1e-4):
+            raise ValueError(
+                "the training context moved, so the two sets are not comparable; "
+                "the new X_test probably has different columns or dtypes")
+
+        kwargs = dict(
+            kernel=self.kernel, gamma=self.gamma,
+            train_ids=self.train_ids, test_ids=test_ids,
+            top_k=self.top_k, min_agreement=self.min_agreement,
+            reference_distances=self._reference_distances,
+            novelty_quantile=self._novelty_quantile,
+            X_train=self.X_train, X_test=X_test, feature_names=self.feature_names,
+        )
+        kwargs.update(overrides)
+        return ClinicalExplainer(self.clf, self.head, self.E_train, E_test,
+                                 self.y_train, **kwargs)
+
     # -- per-case explanation ----------------------------------------------- #
     def neighbours(self, i: int) -> pd.DataFrame:
         """The training cases behind test case ``i``, most influential first."""
