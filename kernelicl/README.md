@@ -214,6 +214,12 @@ file cannot replace a good one. Point `out_path` at mounted Drive on Colab. If a
 session dies, `resume_from` continues from the saved checkpoint — a warm restart,
 since optimiser state and the schedule are not stored.
 
+**If it is slow, look at the `% waiting on data` in the log first.** Synthetic batch
+generation runs on CPU and is usually the bottleneck, not the GPU. Batches are
+generated in background dataloader workers and prefetched, one batch per step split
+into micro-batches afterwards — mirroring TabICL's own trainer. Raise `prior_n_jobs`
+and `prefetch_factor` before reducing anything about the model.
+
 Three details that matter:
 
 - **NLL, not cross-entropy.** The head returns probabilities; `F.cross_entropy` would

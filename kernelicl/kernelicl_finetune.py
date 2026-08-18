@@ -62,6 +62,12 @@ class FinetuneConfig:
     min_train_size: float = 0.6
     max_train_size: float = 0.8
     prior_n_jobs: int = -1
+    """Dataloader workers generating synthetic batches in the background. -1 uses every
+    core. Generation is the usual bottleneck, not the GPU."""
+    prefetch_factor: int = 2
+    """Batches each worker keeps ready. Raise if the GPU still waits on data."""
+    tf32: bool = True
+    """TF32 matmuls. A large free speedup on Ampere and later; no effect elsewhere."""
 
     # Optimisation.
     steps: int = 5000
@@ -246,39 +252,75 @@ def _forward_batch(model, head, batch, cfg, device, num_classes):
     return loss, n_used, accuracy, perplexity
 
 
-def _make_prior(cfg):
-    """A prior dataset, with the worker count probed rather than assumed.
+def _seed_worker(worker_id: int) -> None:
+    """Give each dataloader worker its own seed, or they all generate the same data."""
+    import random
 
-    Some hyperparameter samplers build unpicklable closures, and the failure
-    surfaces from inside a worker pool. Probing turns that into a setup warning.
+    seed = torch.initial_seed() % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def _make_batches(cfg, device):
+    """An iterator of full batches, generated in background workers.
+
+    Two things matter for throughput, both mirroring TabICL's own trainer:
+
+    * ``n_jobs=1`` inside the dataset. ``run_parallel`` builds and tears down a fresh
+      process pool on *every* call, so leaving it above 1 forks a pool per batch and
+      nests that inside the dataloader's own workers. Parallelism belongs to the
+      dataloader.
+    * One batch of ``batch_size`` per step, split into micro-batches afterwards --
+      not one generation per micro-batch. Combined with ``prefetch_factor``, the CPU
+      builds the next batches while the GPU works on this one, instead of the GPU
+      idling through every generation.
+
+    Falls back to synchronous generation if workers cannot start.
     """
+    from torch.utils.data import DataLoader
+
     from tabicl.prior import PriorDataset
 
-    def build(n_jobs):
-        return PriorDataset(
-            regression=False,
-            prior_type=cfg.prior_type,
-            batch_size=cfg.micro_batch,
-            min_features=cfg.min_features,
-            max_features=cfg.max_features,
-            max_seq_len=cfg.max_seq_len,
-            min_train_size=cfg.min_train_size,
-            max_train_size=cfg.max_train_size,
-            n_jobs=n_jobs,
-            device="cpu",
-        )
+    dataset = PriorDataset(
+        regression=False,
+        prior_type=cfg.prior_type,
+        batch_size=cfg.batch_size,
+        min_features=cfg.min_features,
+        max_features=cfg.max_features,
+        max_seq_len=cfg.max_seq_len,
+        min_train_size=cfg.min_train_size,
+        max_train_size=cfg.max_train_size,
+        n_jobs=1,
+        device="cpu",
+    )
 
-    if cfg.prior_n_jobs in (0, 1):
-        return build(1)
+    n_workers = cfg.prior_n_jobs if cfg.prior_n_jobs > 0 else (os.cpu_count() or 1)
+    if n_workers <= 1:
+        return iter(dataset)
 
-    prior = build(cfg.prior_n_jobs)
     try:
-        prior.get_batch()
-        return prior
+        loader = DataLoader(
+            dataset,
+            batch_size=None,        # PriorDataset already yields whole batches
+            num_workers=n_workers,
+            prefetch_factor=cfg.prefetch_factor,
+            persistent_workers=True,
+            pin_memory=(device == "cuda"),
+            worker_init_fn=_seed_worker,
+        )
+        batches = iter(loader)
+        next(batches)
+        return batches
     except Exception as exc:
-        print(f"! parallel prior generation failed ({type(exc).__name__}: {str(exc)[:80]}); "
-              f"falling back to one worker. Generation may now bottleneck the GPU.")
-        return build(1)
+        print(f"! background batch generation failed ({type(exc).__name__}: "
+              f"{str(exc)[:80]}); generating synchronously, which will bottleneck the GPU.")
+        return iter(dataset)
+
+
+def _split_micro_batches(batch, micro_batch: int):
+    """One prior batch -> a list of micro-batches, as the reference trainer does."""
+    parts = [torch.split(t, micro_batch, dim=0) for t in batch]
+    return list(zip(*parts))
 
 
 @torch.no_grad()
@@ -353,9 +395,14 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     amp_dtype = torch.bfloat16 if amp_on and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on and amp_dtype is torch.float16)
 
-    prior = _make_prior(cfg)
+    if cfg.tf32 and device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    batches = _make_batches(cfg, device)
     print(f"generating {cfg.val_batches} validation batches...")
-    val_batches = [prior.get_batch() for _ in range(cfg.val_batches)]
+    val_batches = [mb for _ in range(cfg.val_batches)
+                   for mb in _split_micro_batches(next(batches), cfg.micro_batch)]
 
     accum = max(cfg.batch_size // cfg.micro_batch, 1)
     print(f"device={device} | amp={amp_on} | recompute={cfg.recompute}")
@@ -367,14 +414,19 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     history = {"step": [], "loss": [], "val": []}
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
+    data_seconds = 0.0
 
     for step in range(cfg.steps):
         optimizer.zero_grad(set_to_none=True)
         totals = np.zeros(3)  # loss, accuracy, perplexity
         n_micro = 0
 
-        for _ in range(accum):
-            batch = prior.get_batch()
+        # One generation per step, split afterwards, so the workers can run ahead.
+        waiting = time.perf_counter()
+        micro_batches = _split_micro_batches(next(batches), cfg.micro_batch)
+        data_seconds += time.perf_counter() - waiting
+
+        for batch in micro_batches:
             with torch.autocast(device_type=device, dtype=amp_dtype, enabled=amp_on):
                 loss, _n_used, accuracy, perplexity = _forward_batch(
                     model, head, batch, cfg, device, num_classes)
@@ -398,10 +450,12 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
         history["loss"].append(mean_loss)
 
         if step % cfg.log_every == 0 or step == cfg.steps - 1:
-            rate = (step + 1) / (time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            rate = (step + 1) / elapsed
             print(f"step {step:>5}/{cfg.steps}  loss {mean_loss:.4f}  acc {mean_acc:.3f}  "
                   f"rel.PPL {100 * mean_ppl:.1f}%  lr {scheduler.get_last_lr()[0]:.2e}  "
-                  f"{rate:.2f} step/s")
+                  f"{rate:.2f} step/s  ({100 * data_seconds / elapsed:.0f}% waiting on data, "
+                  f"{cfg.steps * elapsed / (step + 1) / 3600:.1f}h projected)")
 
         if (step + 1) % cfg.val_every == 0 or step == cfg.steps - 1:
             metrics = evaluate(model, head, val_batches, cfg, device, num_classes)
@@ -462,6 +516,11 @@ def smoke_test(device: Optional[str] = None) -> None:
 # Usage
 # --------------------------------------------------------------------------- #
 # smoke_test()                              # do this first; seconds on a GPU
+#
+# # If the log says a large % is spent waiting on data, generation is the bottleneck,
+# # not the GPU. Raise workers and prefetch depth before touching anything else:
+# cfg = FinetuneConfig(**{**PRESETS["paper"].__dict__,
+#                         "prior_n_jobs": 12, "prefetch_factor": 4})
 #
 # # The full Appendix A run, saved where a disconnect cannot take it. The best
 # # checkpoint is rewritten atomically every time validation improves, so an
