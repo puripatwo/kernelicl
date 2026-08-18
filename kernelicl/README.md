@@ -7,6 +7,9 @@ top of this fork of TabICL, plus the tooling to apply it to a real dataset.
 The paper has no public code. Everything here is an implementation of its equations,
 not a port, so treat agreement with its numbers as unverified.
 
+New to this? [SUMMARY.md](SUMMARY.md) explains what it is and what we
+found, in plain language and with no background assumed.
+
 ## What KernelICL is
 
 TabICL predicts by passing an in-context embedding through an MLP. KernelICL replaces
