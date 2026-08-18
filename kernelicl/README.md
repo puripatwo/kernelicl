@@ -56,7 +56,7 @@ Written to be pasted into Colab cells. Only one dependency between them.
 
 | File | What it does | Needs |
 |---|---|---|
-| `kernelicl_colab.py` | 60-line quickstart: the raw mechanics, no abstraction | data |
+| `kernelicl_colab.py` | quickstart: the raw mechanics, no abstraction | data |
 | `kernelicl_clinical.py` | **the core.** `fit_explainer` + `ClinicalExplainer` | — |
 | `kernelicl_analysis.py` | T1–T4, F1/F3/F4/F7 | clinical, data |
 | `kernelicl_embeddings.py` | T5, T6, E1–E4 | clinical, data |

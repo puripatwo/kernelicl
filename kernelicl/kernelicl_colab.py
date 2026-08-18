@@ -1,4 +1,4 @@
-"""Quickstart: the raw KernelICL mechanics on your own data, in about 60 lines.
+"""Quickstart: the raw KernelICL mechanics on your own data.
 
 Shows the whole path explicitly -- preprocess, embed, apply a kernel, read the
 weights -- with no abstraction in the way. For real work use kernelicl_clinical.py,
@@ -14,7 +14,13 @@ from tabicl import TabICLClassifier
 from tabicl._model.kernel_head import KernelHead, relative_perplexity
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-KERNEL, SCALE = "knn", 5   # 5 nearest neighbours: the most legible starting point
+
+# Gaussian, so weights are graded and visibly differ between cases. The kNN kernel
+# gives every selected case exactly 1/k by definition, which reads well on a finished
+# case card but makes this demo look broken -- the whole point here is that the
+# weights vary.
+KERNEL, SCALE = "gaussian", 5.0
+TOP_K = 5
 
 # Weights are indexed positionally against training rows, so a pandas Series with a
 # non-default index would silently do label lookup and report the wrong rows.
@@ -55,15 +61,39 @@ print(f"accuracy        {(pred == y_test).mean():.4f}")
 print(f"weights         {tuple(weights.shape)}  (test cases x training cases)")
 print(f"evidence base   {perplexity.mean() * len(y_train):.1f} of {len(y_train):,} cases")
 
+# The weights genuinely differ per case. Worth confirming rather than assuming,
+# because on an imbalanced cohort the top neighbours often share an outcome and the
+# output can look constant when it is not.
+neighbour_sets = [tuple(sorted(weights[c].topk(TOP_K).indices.tolist()))
+                  for c in range(len(y_test))]
+print(f"distinct top-{TOP_K} neighbour sets: {len(set(neighbour_sets)):,} "
+      f"across {len(neighbour_sets):,} test cases")
+
+# Pick cases worth looking at rather than the first few: with an imbalanced cohort
+# the leading rows are nearly all majority class, so an outcome column full of one
+# value says more about the ordering than about the model.
+picks = [int(weights.max(1).values.argmax())]          # most concentrated prediction
+for cls in np.unique(pred):
+    matching = np.flatnonzero(pred == cls)
+    if len(matching):
+        picks.append(int(matching[0]))                 # one of each predicted class
+picks = list(dict.fromkeys(picks))[:3]
+
 # Every prediction is a weighted average of training outcomes, and w holds the
 # weights. Reading one row of w is the whole interpretability story.
-CASE = 0
-top = weights[CASE].topk(min(SCALE, weights.shape[1]))
-print(f"\ntest case {CASE}: true={y_test[CASE]}, predicted={pred[CASE]}")
-print(f"{'train row':>10} {'weight':>9} {'outcome':>10}")
-for weight, row in zip(top.values.tolist(), top.indices.tolist()):
-    if weight > 0:
-        print(f"{row:>10} {weight:>9.4f} {y_train[row]:>10}")
+for case in picks:
+    top = weights[case].topk(min(TOP_K, weights.shape[1]))
+    print(f"\ntest case {case}: true={y_test[case]}, predicted={pred[case]}, "
+          f"evidence base {perplexity[case] * len(y_train):.1f} cases")
+    print(f"{'train row':>10} {'weight':>9} {'outcome':>10}")
+    for weight, row in zip(top.values.tolist(), top.indices.tolist()):
+        if weight > 0:
+            print(f"{row:>10} {weight:>9.4f} {y_train[row]:>10}")
+    # Total weight per outcome. This is what the prediction actually rests on, and
+    # explains an all-one-value column above: it means the evidence is one-sided.
+    mass = {str(c): float(weights[case][torch.from_numpy(y_train == c)].sum())
+            for c in np.unique(y_train)}
+    print("   weight by outcome:", {k: round(v, 3) for k, v in mass.items()})
 
 influence = weights.sum(0)
 print(f"\ntraining rows never used by any prediction: "
