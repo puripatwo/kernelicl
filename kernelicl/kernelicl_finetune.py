@@ -26,8 +26,8 @@ from torch import nn
 from tabicl._model.kernel_head import KernelHead, relative_perplexity
 from tabicl._model.tabicl import TabICL
 
-__all__ = ["FinetuneConfig", "PRESETS", "benchmark_micro_batch", "finetune",
-           "load_finetuned", "smoke_test"]
+__all__ = ["FinetuneConfig", "PRESETS", "benchmark_micro_batch",
+           "describe_checkpoint", "finetune", "load_finetuned", "smoke_test"]
 
 
 # --------------------------------------------------------------------------- #
@@ -506,6 +506,33 @@ def load_finetuned(path: str, device: Optional[str] = None) -> tuple[TabICL, Ker
     return model.to(device).eval(), head.to(device).eval()
 
 
+def describe_checkpoint(path: str) -> dict:
+    """What produced a saved checkpoint, without loading it onto a device.
+
+    A fine-tuned checkpoint is dataset-independent and reusable indefinitely, so it
+    tends to outlive the memory of how it was made. Everything needed to answer that
+    is stored alongside the weights.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = payload.get("finetune_config", {})
+    summary = {
+        "val_loss": payload.get("val_loss"),
+        "started_from": cfg.get("resume_from") or cfg.get("checkpoint"),
+        "prior_type": cfg.get("prior_type"),
+        "kernel": cfg.get("kernel"),
+        "d_k": cfg.get("d_k"),
+        "steps": cfg.get("steps"),
+        "max_features": cfg.get("max_features"),
+        "max_seq_len": cfg.get("max_seq_len"),
+        "size_mb": round(os.path.getsize(path) / 1e6),
+    }
+    width = max(len(k) for k in summary)
+    print(f"{path}")
+    for key, value in summary.items():
+        print(f"  {key:<{width}}  {value}")
+    return summary
+
+
 def benchmark_micro_batch(preset: str = "paper", candidates=(8, 16, 32),
                           steps: int = 12, cfg: Optional[FinetuneConfig] = None) -> dict:
     """Time a few steps at each micro_batch to find the fastest that fits.
@@ -650,6 +677,11 @@ def smoke_test(device: Optional[str] = None) -> None:
 # v = history["val"]
 # plt.plot([d["step"] for d in v], [d["loss"] for d in v], marker="o")
 # plt.xlabel("step"); plt.ylabel("validation loss"); plt.show()
+#
+# # Fine-tuning is dataset-independent -- it trains on synthetic prior data and never
+# # sees yours -- so this is a one-time cost. Keep the checkpoint and reuse it for any
+# # dataset, in any later session, indefinitely:
+# describe_checkpoint("/content/drive/MyDrive/kernelicl/paper.pt")
 #
 # # Then everything downstream uses it, with the scale recalibrated:
 # ex = fit_explainer(X_train, y_train, X_test,

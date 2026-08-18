@@ -244,6 +244,21 @@ Three details that matter:
 - **kNN is never trained** — it is non-differentiable, so train Gaussian and swap the
   kernel at evaluation, as §4.1 does.
 
+### Run it once
+
+Fine-tuning is **dataset-independent** — it samples synthetic problems from TabICL's
+prior and never sees your data. The result is a general-purpose backbone, exactly like
+the original pretraining, so it is a one-time cost: keep the ~110 MB checkpoint and
+reuse it for any dataset, in any later session, indefinitely.
+
+What still runs each session is `fit_explainer`, which embeds *your* data and
+cross-validates the kernel scale. Minutes, not hours.
+
+Re-run the fine-tune only to change what it produced: a different `d_k`, a
+dot-product head (kNN reuses the Gaussian one), a different starting checkpoint, or
+more steps if the validation curve had not flattened. `describe_checkpoint(path)`
+prints what produced a saved file, which a checkpoint tends to outlive the memory of.
+
 Then `fit_explainer(..., finetuned=path)` uses it everywhere, recalibrating the scale.
 That recalibration is not optional: on a short run the calibrated evidence base moved
 from ~130 cases to ~1, so scales do not transfer between geometries.
