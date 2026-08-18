@@ -414,7 +414,14 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     print(f"{cfg.steps} steps x {accum} x {cfg.micro_batch} datasets "
           f"= effective batch {accum * cfg.micro_batch}\n")
 
-    history = {"step": [], "loss": [], "val": []}
+    # Validate before training so every later number has something to beat. Without
+    # this baseline a falling validation loss is only relative to the first checkpoint
+    # taken, and there is no way to tell whether fine-tuning helped at all.
+    baseline = evaluate(model, head, val_batches, cfg, device, num_classes)
+    print(f"  [val] baseline    loss {baseline['loss']:.4f}  acc {baseline['accuracy']:.3f}  "
+          f"rel.PPL {100 * baseline['perplexity']:.1f}%  (pretrained, untrained head)\n")
+
+    history = {"baseline": baseline, "step": [], "loss": [], "val": []}
     best_val, saved_any = float("inf"), False
     started = time.perf_counter()
     data_seconds = 0.0
@@ -479,8 +486,10 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
                 _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
                                  cfg, best_val)
                 saved_any = True
+            gain = baseline["loss"] - metrics["loss"]
             print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
-                  f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%"
+                  f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%  "
+                  f"({gain:+.4f} vs baseline)"
                   f"{'  <- best, saved' if improved else ''}")
 
     if not saved_any:

@@ -240,7 +240,13 @@ Three details that matter:
   apply a second softmax and flatten the gradients.
 - **Watch validation loss, ignore train loss.** Every step draws a fresh random
   problem of varying difficulty. In one verification run train loss rose 0.75 → 0.90
-  while validation fell 0.5721 → 0.5536 → 0.5512.
+  while validation fell 0.5721 → 0.5536 → 0.5512. A baseline validation runs before
+  training so each later number carries `(+x vs baseline)` — without it a falling
+  curve is only relative to the first checkpoint taken, not to the pretrained model.
+- **`rel.PPL` falling is the geometry sharpening.** Training holds the kernel scale
+  fixed, so the embedding has to adapt to it; a fall from ~100% toward 60% and below
+  is the projection learning to make distance mean something. It is not directly
+  comparable to the paper's 28.6%, which is measured after per-dataset calibration.
 - **kNN is never trained** — it is non-differentiable, so train Gaussian and swap the
   kernel at evaluation, as §4.1 does.
 
