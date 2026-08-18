@@ -138,6 +138,15 @@ So the headline is a 2×2 of correct/wrong against flagged/not-flagged:
   the corruption barely changed which past cases were consulted, so the model was not
   relying on that feature; near 0 means it was.
 
+Four corruptions ship, and they destroy different things, which changes what a drop
+means. `corrupt_constant` collapses a column to one value — for a Gender column that
+records everyone as the commonest value. `corrupt_replace` rewrites specific values
+(`{"female": "male"}`) and leaves other categories intact. `corrupt_shuffle` permutes
+a column, keeping the distribution but breaking the per-row link. `corrupt_copy`
+overwrites one field with another. Shuffle is the cleaner test of "does the model use
+this feature", because a collapse changes both the information and the distribution
+and a drop could be either.
+
 This is valid because **corrupting the test set cannot move the training embeddings**:
 column statistics attend to training rows only (`embed_with_test=False`) and the ICL
 keys are the training context, so the reference library is fixed and every difference

@@ -86,32 +86,83 @@ def limits(v, margin=0.06):
 # --------------------------------------------------------------------------- #
 # Corruptions
 # --------------------------------------------------------------------------- #
-# Each returns a copy; the original is never modified. Supply your own instead if the
-# failure you want to model is not one of these.
-def corrupt_constant(X, column, value):
-    """Overwrite a column with a single value: a sensor stuck, a field defaulted."""
+# Each returns a copy; the original is never modified. ``column`` is a name for a
+# DataFrame or an integer index for an array. Supply your own if the failure you want
+# to model is not one of these.
+#
+# The four differ in what they destroy, and that changes what a drop in accuracy means:
+#
+#   collapse / constant  the variable carries no information AND its distribution
+#                        changes. "What if everyone were recorded as male."
+#   shuffle              the distribution is untouched, only the per-row link breaks.
+#                        "What if this field were filled in at random."
+#   replace              a value-level edit; other categories survive.
+#                        "What if females were recorded as male."
+#   copy                 one field overwritten by another. A data-entry mix-up.
+#
+# Shuffle is the cleaner test of "does the model use this feature", because collapse
+# changes two things at once and a drop could be either.
+def _column(X, column):
+    return X[column].to_numpy() if hasattr(X, "columns") else np.asarray(X)[:, column]
+
+
+def _with_column(X, column, values):
     out = X.copy()
-    out[column] = value
+    if hasattr(out, "columns"):
+        out[column] = values
+    else:
+        out[:, column] = values
     return out
+
+
+def _typical(values):
+    """Median for numbers, most common value otherwise.
+
+    A categorical column has no median, so a single fill value cannot be chosen by
+    dtype-blind code without crashing on strings.
+    """
+    series = pd.Series(values)
+    if pd.api.types.is_numeric_dtype(series):
+        return series.median()
+    mode = series.mode()
+    return mode.iloc[0] if len(mode) else series.iloc[0]
+
+
+def corrupt_constant(X, column, value=None):
+    """Overwrite a column with one value: a field defaulted, a sensor stuck.
+
+    ``value=None`` uses the median for a numeric column and the most common value
+    otherwise -- so on a Gender column it makes everyone whichever value is commonest,
+    which is the categorical version of this test.
+    """
+    if value is None:
+        value = _typical(_column(X, column))
+    return _with_column(X, column, value)
+
+
+def corrupt_replace(X, column, mapping):
+    """Rewrite specific values, leaving the rest alone.
+
+    ``corrupt_replace(X, "Gender", {"female": "male"})`` records every female as male
+    while any other category survives. Narrower than a collapse, and closer to how
+    miscoding actually happens.
+    """
+    return _with_column(X, column, pd.Series(_column(X, column)).replace(mapping).to_numpy())
 
 
 def corrupt_shuffle(X, column, seed=SEED):
     """Permute a column, breaking its link to the row but keeping its distribution.
 
     Isolates whether the model uses the column's *information* or just its presence:
-    marginal statistics are untouched, only the per-row correspondence is destroyed.
+    the marginal statistics are identical, only the per-row correspondence is gone.
     """
-    out = X.copy()
-    values = out[column].to_numpy() if hasattr(out[column], "to_numpy") else np.asarray(out[column])
-    out[column] = np.random.RandomState(seed).permutation(values)
-    return out
+    values = _column(X, column)
+    return _with_column(X, column, np.random.RandomState(seed).permutation(values))
 
 
 def corrupt_copy(X, source, target):
     """Write one column's values into another: the classic data-entry mix-up."""
-    out = X.copy()
-    out[target] = out[source]
-    return out
+    return _with_column(X, target, _column(X, source))
 
 
 # --------------------------------------------------------------------------- #
@@ -207,12 +258,9 @@ emphasis = ex_clean.feature_emphasis()
 TARGET = emphasis.iloc[0]["feature"]
 print(f"\ncorrupting {TARGET!r} (the most emphasised feature per T3)")
 
-if hasattr(X_test, "columns"):
-    X_test_corrupt = corrupt_constant(X_test, TARGET, X_test[TARGET].median())
-else:
-    column = list(FEATURE_NAMES).index(TARGET) if FEATURE_NAMES else 0
-    X_test_corrupt = X_test.copy()
-    X_test_corrupt[:, column] = np.median(X_test[:, column])
+TARGET_COLUMN = TARGET if hasattr(X_test, "columns") else (
+    list(FEATURE_NAMES).index(TARGET) if FEATURE_NAMES else 0)
+X_test_corrupt = corrupt_constant(X_test, TARGET_COLUMN)
 
 # Same model, same scale, same thresholds -- only the cases differ.
 ex_corrupt = ex_clean.for_test_set(X_test_corrupt, test_ids=ex_clean.test_ids)
@@ -353,9 +401,10 @@ plt.show()
 # Paste kernelicl_clinical.py first, then this file. It corrupts the most emphasised
 # feature by default; edit the "Run" section for your own corruption:
 #
-#   X_test_corrupt = corrupt_constant(X_test, "age", 0)
-#   X_test_corrupt = corrupt_shuffle(X_test, "age")          # keeps the distribution
-#   X_test_corrupt = corrupt_copy(X_test, "sex", "age")      # data-entry mix-up
+#   X_test_corrupt = corrupt_constant(X_test, "Gender")             # everyone the mode
+#   X_test_corrupt = corrupt_replace(X_test, "Gender", {"female": "male"})
+#   X_test_corrupt = corrupt_shuffle(X_test, "Gender")              # keeps the mix
+#   X_test_corrupt = corrupt_copy(X_test, "Gender", "Age")          # data-entry mix-up
 #   ex_corrupt = ex_clean.for_test_set(X_test_corrupt, test_ids=ex_clean.test_ids)
 #
 # Read S1 first. "detection rate" is the answer to whether the model noticed: if it
