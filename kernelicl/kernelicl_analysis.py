@@ -7,12 +7,16 @@ See README.md for what each table and figure answers and how to read it.
 """
 
 import time
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 from matplotlib.lines import Line2D
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.metrics import (accuracy_score, average_precision_score,
+                             balanced_accuracy_score, f1_score,
+                             matthews_corrcoef, roc_auc_score)
 from sklearn.neighbors import KNeighborsClassifier
 
 from tabicl import TabICLClassifier
@@ -38,17 +42,92 @@ FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
 # changes which scale is selected, not only what is reported.
 METRIC = "balanced_accuracy"   # "accuracy" | "balanced_accuracy"
 
+# Which outcome counts as positive for sensitivity, F1 and AUPRC. None picks the rarer
+# training class, which is the screening convention.
+POSITIVE_LABEL = None
+
+# Display names, for figures that go into a write-up. Keys are your raw label values.
+CLASS_LABELS = {}     # e.g. {0: "Adherence", 1: "Non-adherence"}
+
+# Where to write publication copies, and at what resolution. None shows only.
+SAVE_FIGURES = None   # e.g. "figures"
+FIG_DPI = 300
+FIG_FORMATS = ("png", "pdf")
+
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
 y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
 y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
 
 
 def evaluate(y_true, y_pred) -> float:
+    """The single metric that drives calibration and the sweep charts."""
     if METRIC == "accuracy":
         return float(accuracy_score(y_true, y_pred))
     if METRIC == "balanced_accuracy":
         return float(balanced_accuracy_score(y_true, y_pred))
     raise ValueError(f"unknown METRIC {METRIC!r}")
+
+
+def all_metrics(y_true, y_pred, scores=None, positive=None) -> dict:
+    """A binary metric panel.
+
+    Which to lead with, for an imbalanced screening problem:
+
+    * **balanced accuracy** -- mean of sensitivity and specificity. Immune to the
+      base rate, which plain accuracy is not.
+    * **MCC** -- the best single-number summary here. It uses all four cells of the
+      confusion matrix, so unlike F1 it cannot be inflated by ignoring true negatives,
+      and it stays honest under heavy imbalance.
+    * **AUROC** -- threshold-free ranking quality, and the metric clinical readers
+      expect. It is optimistic when positives are rare, so pair it with the next one.
+    * **AUPRC** -- average precision. Focused on the positive class, and the more
+      informative of the two curves when positives are a small minority.
+    * **sensitivity / specificity** -- what a screening programme is actually
+      commissioned on. Reported separately because a single number hides which of the
+      two a model is trading away.
+
+    F1 is included because it is conventional, but it ignores true negatives and
+    depends on which class you call positive, so MCC is the better summary.
+
+    ``scores`` are probabilities of the positive class; without them the two
+    threshold-free metrics are omitted.
+    """
+    from sklearn.metrics import confusion_matrix
+
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    out = {"balanced accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+           "accuracy": float(accuracy_score(y_true, y_pred))}
+    labels = np.unique(np.concatenate([y_true, y_pred]))
+    if len(labels) != 2:
+        return out                      # the rest are binary-only
+
+    positive = labels[-1] if positive is None else positive
+    negative = [c for c in labels if c != positive][0]
+    truth = y_true == positive
+    guess = y_pred == positive
+    tn, fp, fn, tp = confusion_matrix(truth, guess, labels=[False, True]).ravel()
+
+    out["MCC"] = float(matthews_corrcoef(y_true, y_pred))
+    out["F1"] = float(f1_score(truth, guess, zero_division=0))
+    out["sensitivity"] = float(tp / (tp + fn)) if tp + fn else float("nan")
+    out["specificity"] = float(tn / (tn + fp)) if tn + fp else float("nan")
+    if scores is not None and len(np.unique(truth)) == 2:
+        out["AUROC"] = float(roc_auc_score(truth, scores))
+        out["AUPRC"] = float(average_precision_score(truth, scores))
+    out["_positive"] = positive
+    out["_negative"] = negative
+    return out
+
+
+def finish(fig, name: str):
+    """Show a figure, and write a publication copy when SAVE_FIGURES is set."""
+    if SAVE_FIGURES:
+        directory = Path(SAVE_FIGURES)
+        directory.mkdir(parents=True, exist_ok=True)
+        for suffix in FIG_FORMATS:
+            fig.savefig(directory / f"{name}.{suffix}", dpi=FIG_DPI,
+                        bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.show()
 
 
 # --------------------------------------------------------------------------- #
@@ -178,37 +257,89 @@ print("\n* = scale selected on held-out data")
 # --------------------------------------------------------------------------- #
 # T2 - method comparison
 # --------------------------------------------------------------------------- #
-# TabICL-MLP is absent on purpose: in the paper it is the same architecture
-# fine-tuned with an MLP head, so without fine-tuning it is bit-identical to
-# TabICL (single). Reporting it would be inventing a number.
-clf_ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED)
-clf_ensemble.fit(X_train, y_train)
+# TabICL rows must come from a *pretrained* classifier. `clf` carries the fine-tuned
+# weights when FINETUNED is set, so reusing it here would silently report the
+# fine-tuned model as stock TabICL and make the comparison meaningless.
+#
+# TabICL-MLP is that same fine-tuned backbone read through its MLP decoder instead of
+# the kernel -- the control that isolates what the kernel head costs, holding the
+# representation fixed. One caveat: the decoder is frozen during fine-tuning, so it
+# has not adapted to a backbone that moved under it. The paper's TabICL-MLP is trained
+# *with* its MLP head in the loop, which would need a separate run. Ours is therefore
+# a lower bound on what an MLP head could do, and the gap to KernelICL an upper bound.
+POSITIVE = (POSITIVE_LABEL if POSITIVE_LABEL is not None
+            else np.unique(y_train)[np.argmin(np.bincount(
+                ex.clf.y_encoder_.transform(y_train)))])
+positive_column = list(ex.clf.classes_).index(POSITIVE)
+print(f"\npositive class for sensitivity / F1 / AUPRC: {POSITIVE}")
 
-started = time.perf_counter()
-metric_ensemble = evaluate(y_test, clf_ensemble.predict(X_test))
-time_ensemble = time.perf_counter() - started
+pretrained = TabICLClassifier(n_estimators=1, norm_methods=["none"],
+                              feat_shuffle_method="none", class_shuffle_method="none",
+                              device=DEVICE, random_state=SEED, kv_cache=False)
+pretrained.fit(X_train, y_train)
+ensemble = TabICLClassifier(n_estimators=8, device=DEVICE, random_state=SEED)
+ensemble.fit(X_train, y_train)
 
-started = time.perf_counter()
-metric_single = evaluate(y_test, clf.predict(X_test))
-time_single = time.perf_counter() - started
 
-T2 = [("TabICL (ensemble, n=8)", metric_ensemble, None, time_ensemble),
-      ("TabICL (single)", metric_single, None, time_single),
-      ("TabICL-MLP", None, None, None)]
+def timed_estimator(estimator):
+    started = time.perf_counter()
+    proba = estimator.predict_proba(X_test)
+    elapsed = time.perf_counter() - started
+    pred = estimator.classes_[proba.argmax(1)]
+    return pred, proba[:, list(estimator.classes_).index(POSITIVE)], elapsed
+
+
+def timed_kernel(kernel, scale):
+    """Standalone cost: the embedding pass plus the kernel, as if run alone."""
+    started = time.perf_counter()
+    E_train, E_test = _embed(clf, X_test)
+    head.kernel = kernel
+    y_ctx = torch.from_numpy(
+        clf.y_encoder_.transform(y_train)).float().to(E_train.device)[None]
+    with torch.no_grad():
+        probs, w = head(E_train, E_test, y_ctx, num_classes=n_classes, gamma=scale)
+    elapsed = time.perf_counter() - started
+    proba = probs[0].cpu().numpy()
+    pred = clf.y_encoder_.inverse_transform(proba.argmax(-1))
+    return pred, proba[:, positive_column], relative_perplexity(w).mean().item(), elapsed
+
+
+ROWS = []
+for name, estimator in [("TabICL (ensemble, n=8)", ensemble),
+                        ("TabICL (single)", pretrained)]:
+    pred, scores, seconds = timed_estimator(estimator)
+    ROWS.append((name, all_metrics(y_test, pred, scores, POSITIVE), None, seconds))
+
+if FINETUNED:
+    pred, scores, seconds = timed_estimator(clf)     # fine-tuned backbone, MLP head
+    ROWS.append(("TabICL-MLP (fine-tuned)", all_metrics(y_test, pred, scores, POSITIVE),
+                 None, seconds))
+else:
+    ROWS.append(("TabICL-MLP", {}, None, None))
+
 for kernel in KERNELS:
-    metric, perplexity, _ = score(kernel, BEST[kernel])
-    T2.append((LABEL[kernel], metric, perplexity, None))
+    pred, scores, perplexity, seconds = timed_kernel(kernel, BEST[kernel])
+    ROWS.append((LABEL[kernel], all_metrics(y_test, pred, scores, POSITIVE),
+                 perplexity, seconds))
 
-print(f"\n{'method':>24} {METRIC[:10]:>12} {'rel.PPL%':>10} {'time (s)':>10}")
-for name, metric, perplexity, seconds in T2:
-    print(f"{name:>24} {f'{metric:.4f}' if metric is not None else '-':>12} "
-          f"{f'{100 * perplexity:.2f}' if perplexity is not None else '-':>10} "
-          f"{f'{seconds:.1f}' if seconds is not None else '-':>10}")
-print("\nKernelICL times omitted: all three share one embedding pass here.")
-print("TabICL-MLP is identical to TabICL (single) until the model is fine-tuned.")
+COLUMNS = ["balanced accuracy", "MCC", "AUROC", "AUPRC", "sensitivity", "specificity", "F1"]
+T2 = pd.DataFrame(
+    [{"method": name, **{c: metrics.get(c) for c in COLUMNS},
+      "rel.PPL %": None if perplexity is None else 100 * perplexity,
+      "time (s)": seconds}
+     for name, metrics, perplexity, seconds in ROWS]
+).set_index("method")
+print()
+print(T2.to_string(float_format=lambda v: f"{v:.3f}", na_rep="-"))
+
+if not FINETUNED:
+    print("\nTabICL-MLP is blank: without fine-tuning it is bit-identical to "
+          "TabICL (single).")
+print("KernelICL times include a full embedding pass, so they are standalone costs; "
+      "run together\n  the three share one pass. kNN probabilities are multiples of "
+      "1/k, which handicaps\n  AUROC and AUPRC against the graded kernels.")
 
 
-# --------------------------------------------------------------------------- #
 # T3 / F4 - what the learned metric treats as similar
 # --------------------------------------------------------------------------- #
 emphasis = ex.with_kernel("knn", gamma=COMPACTNESS_K).feature_emphasis(k=COMPACTNESS_K)
@@ -231,11 +362,12 @@ ax.barh(positions, values, color=np.where(values >= 0, C_BLUE, C_RED), height=0.
 ax.axvline(0, color=INK_3, linewidth=1)
 ax.set_yticks(positions)
 ax.set_yticklabels([emphasis.iloc[i]["feature"][:28] for i in show], fontsize=8)
-tidy(ax, f"F4  Which features the learned metric tightens on (k={COMPACTNESS_K})",
+tidy(ax, f"Features the learned metric treats as defining similarity "
+         f"(k={COMPACTNESS_K})",
      "<- looser than plain kNN      relative difference (%)      tighter ->")
 ax.grid(axis="y", visible=False)
 plt.tight_layout()
-plt.show()
+finish(fig, "feature_emphasis")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,8 +408,12 @@ for kernel in KERNELS:
 
 ax.plot(*zip(*sorted((100 * r["ppl"], r["plain"]) for r in T4)), color=INK_3,
         linewidth=1.5, linestyle="--", label="plain kNN (input space)", zorder=2)
-ax.axhline(metric_single, color=INK_3, linewidth=1, linestyle=":", zorder=1)
-ax.annotate("TabICL (single)", xy=(1.0, metric_single), xycoords=("axes fraction", "data"),
+# Reference line: the stock model, or the fine-tuned MLP control when there is one --
+# whichever is the fair thing for the kernels to be judged against.
+REFERENCE = ("TabICL-MLP (fine-tuned)" if FINETUNED else "TabICL (single)")
+reference_value = T2.loc[REFERENCE, METRIC.replace("_", " ")]
+ax.axhline(reference_value, color=INK_3, linewidth=1, linestyle=":", zorder=1)
+ax.annotate(REFERENCE, xy=(1.0, reference_value), xycoords=("axes fraction", "data"),
             xytext=(-4, 4), textcoords="offset points", ha="right", color=INK_2, fontsize=9)
 
 # Labels float above the curves with a stagger: the three variants often sit within a
@@ -290,12 +426,12 @@ for kernel, dy in zip(KERNELS, (20, 12, 4)):
 ax.set_xscale("log")
 ax.set_xticks([0.1, 1, 10, 100])
 ax.set_xticklabels(["0.1", "1", "10", "100"])
-tidy(ax, f"F1  {METRIC.replace('_', ' ').capitalize()} against inspectability",
+tidy(ax, f"{METRIC.replace('_', ' ').capitalize()} against explainability",
      "relative perplexity (%, log scale) - lower is more inspectable",
      f"test {METRIC.replace('_', ' ')}")
 ax.legend(loc="center right", fontsize=9)
 plt.tight_layout()
-plt.show()
+finish(fig, "accuracy_vs_explainability")
 
 
 # --------------------------------------------------------------------------- #
@@ -384,11 +520,11 @@ for ax, idx, tag in zip(axes, PICKS, PICK_TAGS):
             f"test row {idx} - {tag}   rel. PPL {100 * row_ppl[idx]:.1f}%   "
             f"true {y_test[idx]} / pred {pred_soft[idx]}",
             transform=ax.transAxes, ha="right", va="top", fontsize=9, color=INK_2)
-axes[0].set_title("F3  Which training cases each prediction uses", color=INK,
+axes[0].set_title("Which training cases each prediction uses", color=INK,
                   fontsize=11, loc="left", pad=10)
 axes[-1].set_xlabel(f"training cases, ordered by {PROJ_NAME} dimension 1")
 plt.tight_layout()
-plt.show()
+finish(fig, "weight_distributions")
 
 
 # --------------------------------------------------------------------------- #
@@ -456,10 +592,116 @@ handles += [Line2D([], [], marker="o", linestyle="", markersize=4, color=GRID,
                    label="the case being decided")]
 fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
            bbox_to_anchor=(0.5, -0.02))
-fig.suptitle(f"F7  Training cases in {PROJ_NAME} space, sized by contribution",
+fig.suptitle(f"Training cases in the learned embedding ({PROJ_NAME}), "
+             f"sized by contribution",
              color=INK, fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "weights_in_embedding")
+
+
+# --------------------------------------------------------------------------- #
+# Figure 8 - the combined view, for a write-up
+# --------------------------------------------------------------------------- #
+# Two spaces down the rows, three views across the columns, following the structure of
+# the paper's Figure 2: a reference panel showing where the outcomes sit, then the same
+# space for the most concentrated and most diffuse predictions.
+IDX_CONCENTRATED, IDX_DIFFUSE = int(row_ppl.argmin()), int(row_ppl.argmax())
+CASE_COLUMNS = [(IDX_CONCENTRATED, "Most concentrated prediction"),
+                (IDX_DIFFUSE, "Most diffuse prediction")]
+
+
+def class_name(c):
+    """Display name for an encoded class index."""
+    raw = clf.classes_[c]
+    return f"{CLASS_LABELS.get(raw, raw)} ({raw})"
+
+
+fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.4),
+                         gridspec_kw={"hspace": 0.32, "wspace": 0.18})
+
+# (a) sample space: every training case along the ordering, coloured by outcome.
+ax = axes[0, 0]
+for c in range(n_classes):
+    at = np.flatnonzero(y_train_enc[order] == c)
+    ax.vlines(at, 0, 1, color=class_style(c)[0], linewidth=0.7, alpha=0.85,
+              label=class_name(c))
+ax.set_ylim(0, 1)
+ax.set_yticks([])
+ax.set_xlim(0, len(order))
+ax.set_xlabel("training cases, ordered by embedding")
+ax.set_title("Outcome of every training case", fontsize=10, color=INK, loc="left", pad=8)
+for side in ("top", "right", "left"):
+    ax.spines[side].set_visible(False)
+ax.grid(False)
+
+# (b), (c) sample space: how much each training case contributed.
+peak = float(weights[[IDX_CONCENTRATED, IDX_DIFFUSE]].max())
+for column, (idx, heading) in enumerate(CASE_COLUMNS, start=1):
+    ax = axes[0, column]
+    ax.vlines(np.arange(len(order)), 0, weights[idx].numpy()[order], color=C_BLUE,
+              linewidth=0.7)
+    ax.set_ylim(0, peak * 1.08)
+    ax.set_xlim(0, len(order))
+    ax.set_xlabel("training cases, ordered by embedding")
+    ax.set_ylabel("contribution" if column == 1 else "")
+    ax.set_title(f"{heading}\nevidence base {row_ppl[idx] * len(y_train):.0f} of "
+                 f"{len(y_train):,} cases", fontsize=10, color=INK, loc="left", pad=8)
+    ax.grid(False)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+# (d) embedding space: the same reference, in two dimensions.
+ax = axes[1, 0]
+for c in range(n_classes):
+    at = y_train_enc == c
+    ax.scatter(proj[at, 0], proj[at, 1], s=6, color=class_style(c)[0], alpha=0.6,
+               linewidths=0, label=class_name(c))
+bare(ax)
+ax.set_xlim(*XLIM)
+ax.set_ylim(*YLIM)
+ax.set_title(f"Learned embedding ({PROJ_NAME})", fontsize=10, color=INK, loc="left", pad=8)
+
+# (e), (f) embedding space: the same two predictions, sized by contribution.
+for column, (idx, heading) in enumerate(CASE_COLUMNS, start=1):
+    ax = axes[1, column]
+    wt = weights[idx].numpy()
+    heavy = wt > wt.max() * 0.02
+    ax.scatter(proj[~heavy, 0], proj[~heavy, 1], s=4, color=GRID, linewidths=0, zorder=1)
+    for c in range(n_classes):
+        at = heavy & (y_train_enc == c)
+        if at.any():
+            ax.scatter(proj[at, 0], proj[at, 1], s=8 + 260 * wt[at] / peak,
+                       color=class_style(c)[0], alpha=0.7, linewidths=0.5,
+                       edgecolors=SURFACE, zorder=2)
+    tx, ty = proj_test[idx]
+    ax.scatter(np.clip(tx, *XLIM), np.clip(ty, *YLIM), marker="X", s=150, color=INK,
+               edgecolors=SURFACE, linewidths=1.5, zorder=3)
+    bare(ax)
+    ax.set_xlim(*XLIM)
+    ax.set_ylim(*YLIM)
+    predicted = CLASS_LABELS.get(pred_soft[idx], pred_soft[idx])
+    actual = CLASS_LABELS.get(y_test[idx], y_test[idx])
+    ax.set_title(f"predicted {predicted}, actually {actual}", fontsize=10,
+                 color=INK_2, loc="left", pad=8)
+
+# Row labels, and panel letters so the text can refer to them.
+for row, label in enumerate(("Sample space", f"Embedding space")):
+    axes[row, 0].text(-0.16, 0.5, label, transform=axes[row, 0].transAxes,
+                      rotation=90, va="center", ha="center", fontsize=11, color=INK)
+for ax, letter in zip(axes.ravel(), "abcdef"):
+    ax.text(-0.04, 1.12, f"({letter})", transform=ax.transAxes, fontsize=11,
+            fontweight="bold", va="top", ha="right", color=INK)
+
+handles = [Line2D([], [], marker="o", linestyle="", markersize=8,
+                  color=class_style(c)[0], label=class_name(c))
+           for c in range(n_classes)]
+handles += [Line2D([], [], marker="o", linestyle="", markersize=5, color=GRID,
+                   label="negligible contribution"),
+            Line2D([], [], marker="X", linestyle="", markersize=9, color=INK,
+                   label="the case being predicted")]
+fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
+           bbox_to_anchor=(0.5, -0.04))
+finish(fig, "figure8_evidence")
 
 
 # --------------------------------------------------------------------------- #

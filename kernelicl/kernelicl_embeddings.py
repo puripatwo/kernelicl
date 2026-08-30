@@ -29,6 +29,12 @@ SEED = 0
 PURITY_K = (1, 5, 10, 20, 50)
 FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
 
+# Where to write publication copies, and at what resolution. None shows only.
+SAVE_FIGURES = None   # e.g. "figures"
+FIG_DPI = 300
+FIG_FORMATS = ("png", "pdf")
+
+
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
 y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
 y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
@@ -66,6 +72,19 @@ def bare(ax, title=None):
     if title:
         ax.set_title(title, color=INK_2, fontsize=9, loc="left")
     return ax
+
+
+def finish(fig, name: str):
+    """Show a figure, and write a publication copy when SAVE_FIGURES is set."""
+    if SAVE_FIGURES:
+        from pathlib import Path
+
+        directory = Path(SAVE_FIGURES)
+        directory.mkdir(parents=True, exist_ok=True)
+        for suffix in FIG_FORMATS:
+            fig.savefig(directory / f"{name}.{suffix}", dpi=FIG_DPI,
+                        bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.show()
 
 
 def limits(v, margin=0.06):
@@ -214,10 +233,10 @@ handles.append(Line2D([], [], marker="o", linestyle="", markersize=5, color=GRID
                       label="training case"))
 fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=9,
            bbox_to_anchor=(0.5, -0.03), title="test-case outcome", title_fontsize=9)
-fig.suptitle(f"E1  Where the outcomes sit, stage by stage ({PROJ_NAME})", color=INK,
+fig.suptitle(f"Where the outcomes sit at each stage of the model ({PROJ_NAME})", color=INK,
              fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "stages_side_by_side")
 
 
 # --------------------------------------------------------------------------- #
@@ -243,10 +262,10 @@ axes[1].legend(loc="upper right", fontsize=9)
 for ax in axes:
     ax.set_xlim(*XLIM)
     ax.set_ylim(*YLIM)
-fig.suptitle(f"E2  Test cases in the learned embedding ({PROJ_NAME})", color=INK,
+fig.suptitle(f"Test cases against the training population ({PROJ_NAME})", color=INK,
              fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "test_over_training")
 
 
 # --------------------------------------------------------------------------- #
@@ -267,10 +286,10 @@ bare(ax, f"gray = training cases   -   median evidence base "
          f"{np.median(ex.evidence_cases):.0f} of {len(y_train):,}")
 ax.set_xlim(*XLIM)
 ax.set_ylim(*YLIM)
-fig.suptitle(f"E3  Evidence base across the embedding ({PROJ_NAME})", color=INK,
+fig.suptitle(f"How much evidence each prediction rests on ({PROJ_NAME})", color=INK,
              fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "evidence_across_embedding")
 
 
 # --------------------------------------------------------------------------- #
@@ -292,10 +311,10 @@ for ax, position, tag in [(axes[0], 0, "most emphasised"), (axes[1], -1, "least 
     colorbar.outline.set_visible(False)
     colorbar.set_label("standardized value", fontsize=8, color=INK_2)
     bare(ax, f"{tag}: {feature}")
-fig.suptitle(f"E4  Feature gradients across the embedding ({PROJ_NAME})", color=INK,
+fig.suptitle(f"How measurements vary across the embedding ({PROJ_NAME})", color=INK,
              fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "feature_gradients")
 
 
 # --------------------------------------------------------------------------- #

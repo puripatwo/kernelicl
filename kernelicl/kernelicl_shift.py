@@ -33,6 +33,12 @@ SEED = 0
 TOP_K = 5          # neighbourhood size for the evidence-overlap measure
 FINETUNED = None   # path to a kernelicl_finetune checkpoint, or None
 
+# Where to write publication copies, and at what resolution. None shows only.
+SAVE_FIGURES = None   # e.g. "figures"
+FIG_DPI = 300
+FIG_FORMATS = ("png", "pdf")
+
+
 FEATURE_NAMES = list(X_train.columns) if hasattr(X_train, "columns") else None
 y_train = (y_train.to_numpy() if hasattr(y_train, "to_numpy") else np.asarray(y_train)).ravel()
 y_test = (y_test.to_numpy() if hasattr(y_test, "to_numpy") else np.asarray(y_test)).ravel()
@@ -64,6 +70,19 @@ def tidy(ax, title=None, xlabel=None, ylabel=None):
         ax.set_ylabel(ylabel)
     ax.set_axisbelow(True)
     return ax
+
+
+def finish(fig, name: str):
+    """Show a figure, and write a publication copy when SAVE_FIGURES is set."""
+    if SAVE_FIGURES:
+        from pathlib import Path
+
+        directory = Path(SAVE_FIGURES)
+        directory.mkdir(parents=True, exist_ok=True)
+        for suffix in FIG_FORMATS:
+            fig.savefig(directory / f"{name}.{suffix}", dpi=FIG_DPI,
+                        bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.show()
 
 
 def bare(ax, title=None):
@@ -319,10 +338,10 @@ for ax, ex, label in [(axes[0], ex_clean, "clean"), (axes[1], ex_corrupt, "corru
 axes[0].annotate("wrong points below-left of the\ndashed lines are silent failures",
                  xy=(0.03, 0.06), xycoords="axes fraction", fontsize=8,
                  color=INK_2, style="italic")
-fig.suptitle("G1  Did the model have any warning?", color=INK, fontsize=11,
+fig.suptitle("Did the model have any warning?", color=INK, fontsize=11,
              x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "warning_signals")
 
 
 # --------------------------------------------------------------------------- #
@@ -340,10 +359,11 @@ ax.scatter(ex_clean.agreement[~broke_mask], ex_corrupt.agreement[~broke_mask], s
 ax.scatter(ex_clean.agreement[broke_mask], ex_corrupt.agreement[broke_mask], s=34,
            color=C_RED, alpha=0.85, linewidths=0.5, edgecolors=SURFACE, zorder=3,
            label=f"broke ({broke})")
-tidy(ax, "G2  Confidence before and after", "agreement, clean", "agreement, corrupted")
+tidy(ax, "Confidence before and after corruption",
+     "agreement, clean data", "agreement, corrupted data")
 ax.legend(loc="upper left", fontsize=9)
 plt.tight_layout()
-plt.show()
+finish(fig, "confidence_shift")
 
 
 # --------------------------------------------------------------------------- #
@@ -389,10 +409,10 @@ bare(ax)
 ax.set_xlim(*limits(np.vstack([P_train, P_clean, P_corrupt])[:, 0]))
 ax.set_ylim(*limits(np.vstack([P_train, P_clean, P_corrupt])[:, 1]))
 ax.legend(loc="upper right", fontsize=9)
-fig.suptitle(f"G3  Where the corruption moved the cohort ({PROJ_NAME})", color=INK,
+fig.suptitle(f"Where the corruption moved the cohort ({PROJ_NAME})", color=INK,
              fontsize=11, x=0.01, ha="left")
 plt.tight_layout()
-plt.show()
+finish(fig, "cohort_movement")
 
 
 # --------------------------------------------------------------------------- #

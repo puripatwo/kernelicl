@@ -61,7 +61,7 @@ Written to be pasted into Colab cells. Only one dependency between them.
 |---|---|---|
 | `kernelicl_quickstart.py` | quickstart: the raw mechanics, no abstraction | data |
 | `kernelicl_clinical.py` | **the core.** `fit_explainer` + `ClinicalExplainer` | — |
-| `kernelicl_analysis.py` | T1–T4, F1/F3/F4/F7 | clinical, data |
+| `kernelicl_analysis.py` | T1–T4, F1/F3/F4/F7/F8 | clinical, data |
 | `kernelicl_embeddings.py` | T5, T6, E1–E4 | clinical, data |
 | `kernelicl_shift.py` | corruption testing: S1–S2, G1–G3 | clinical, data |
 | `kernelicl_finetune.py` | trains the embedding for the kernel | — |
@@ -94,6 +94,12 @@ sits at its bottom, commented out.
 
 ### Tables and figures
 
+Set `SAVE_FIGURES = "figures"` at the top of any of the three analysis files to write
+every figure as PNG *and* PDF at 300 dpi as it is drawn. The PDF is vector, so it is
+the one to place in a thesis. Titles are written for a reader who has not seen this
+README — the `F1`/`E1`/`G1` codenames below are for navigating the files only and do
+not appear on the plots.
+
 | | Answers | Read it for |
 |---|---|---|
 | **T1** | kernel × scale → metric, sparsity, time | how expensive sparsity is on your data |
@@ -103,6 +109,7 @@ sits at its bottom, commented out.
 | **F1** | metric vs inspectability | **read first** — sets the operating point |
 | **F3** | per-prediction weight distribution | how much evidence, and how concentrated |
 | **F7** | weights in embedding space | where that evidence sits |
+| **F8** | the six-panel evidence figure | one figure for a write-up |
 | **T5 / T6 / E1** | purity, raw vs `TF_row` vs `TF_icl` | whether to fine-tune |
 | **E2** | test cases over training, and error locations | extrapolation, and clustered failure |
 | **E3** | evidence base across the space | sanity check on the scale |
@@ -111,9 +118,23 @@ sits at its bottom, commented out.
 | **S2** | how far the evidence moved | whether the feature was being used |
 | **G1–G3** | confidence vs unfamiliarity, paired shift, cohort movement | where silent failures sit |
 
-**T2 has a deliberate gap.** TabICL-MLP is reported as `-`: in the paper it is the
-same architecture fine-tuned with an MLP head, so without fine-tuning it is
-bit-identical to TabICL (single). Filling that cell would be inventing a number.
+**T2's TabICL-MLP row needs a checkpoint.** In the paper it is the same architecture
+fine-tuned with an MLP head, so without fine-tuning it is bit-identical to TabICL
+(single) and prints as `-`. Set `FINETUNED` to a `kernelicl_finetune` checkpoint and
+the row fills in; the kernel rows then use those weights too, so the comparison is
+like-for-like. Note that `FINETUNED` changes what "TabICL-MLP" and the KernelICL rows
+mean but never the two stock TabICL rows, which are always built from the released
+checkpoint.
+
+**T2 reports seven metrics plus wall-clock time.** On imbalanced binary outcomes read
+**MCC** first: it is the only one of these that a majority-class predictor cannot
+inflate, and it moves only when both classes are handled. **Balanced accuracy** stays
+as the headline because it is the paper's metric and drives the calibration.
+**AUROC/AUPRC** grade the ranking rather than the decision, so they answer "could a
+different threshold do better" — AUPRC is the one to watch when positives are rare.
+**Sensitivity/specificity** are the two numbers a clinical reader will ask for
+directly. **F1** is included because it is conventional, but it ignores true negatives
+and depends on which class you call positive, so MCC is the better summary.
 
 **T3's columns are normalized within each method**, so they show relative *emphasis*,
 not absolute closeness. KernelICL neighbourhoods are typically *wider* in raw feature
@@ -337,6 +358,11 @@ selects most records, so it cannot support the label audit at all.
 starting points, not validated values. They decide how many cases reach a human. In
 screening a missed positive usually costs far more than a review, which argues for a
 higher agreement threshold. Changing them re-runs no model.
+
+**Name your classes.** `CLASS_LABELS = {0: "Adherence", 1: "Non-adherence"}` in the
+analysis file puts those words on axes, legends and titles instead of `0` and `1`.
+`POSITIVE_LABEL` tells the asymmetric metrics (sensitivity, F1, AUPRC) which class is
+the event; it defaults to the rarer one, which is usually right.
 
 **Use balanced accuracy, not accuracy.** `METRIC` in the analysis file. On an 85/15
 split, low-γ configurations scored 0.500 balanced where plain accuracy read 0.85 —
