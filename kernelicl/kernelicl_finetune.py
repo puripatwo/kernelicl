@@ -588,6 +588,11 @@ def describe_checkpoint(path: str) -> dict:
         "kernel": cfg.get("kernel"),
         "d_k": cfg.get("d_k"),
         "steps": cfg.get("steps"),
+        # The rate a checkpoint was trained at decides whether rerunning could beat it:
+        # the level a run plateaus at depends on it, even though the plateau itself does
+        # not. Older checkpoints predate the 1e-5 -> 1e-4 default.
+        "lr_backbone": cfg.get("lr_backbone"),
+        "lr_head": cfg.get("lr_head"),
         "max_features": cfg.get("max_features"),
         "max_seq_len": cfg.get("max_seq_len"),
         "size_mb": round(os.path.getsize(path) / 1e6),
