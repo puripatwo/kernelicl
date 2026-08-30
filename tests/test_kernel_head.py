@@ -356,6 +356,28 @@ def test_forward_kernel_defaults_inference_device_to_the_model(monkeypatch):
 
 
 @torch.no_grad()
+def test_forward_kernel_disables_amp_on_cpu():
+    """A default config must not autocast on CPU.
+
+    The inference manager applies autocast on whatever device it is given, and
+    `torch.autocast("cpu")` means bfloat16. Parts of this forward run outside the
+    manager -- the chunked ICL path especially -- so their float32 weights then meet
+    bfloat16 activations. TabICLBaseEstimator resolves "auto" to False on CPU for the
+    same reason.
+    """
+    model = make_tabicl()
+    model.kernel_head = KernelHead(d_model=16 * 2, d_k=16 * 2, kernel="gaussian")
+    model.eval()
+    X = torch.randn(1, N_TRAIN + N_TEST, 5)
+    y_train = torch.randint(0, 3, (1, N_TRAIN)).float()
+
+    probs, w = model.forward_kernel(X, y_train, query_chunk_size=4)
+
+    assert probs.dtype is torch.float32 and w.dtype is torch.float32
+    torch.testing.assert_close(w.sum(-1), torch.ones(1, N_TEST))
+
+
+@torch.no_grad()
 def test_forward_kernel_requires_a_head():
     model = make_tabicl()
     X = torch.randn(1, N_TRAIN + N_TEST, 5)

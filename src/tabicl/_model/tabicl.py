@@ -632,6 +632,14 @@ class TabICL(nn.Module):
                                    inference_config.ICL_CONFIG):
                     if mgr_config["device"] is None:
                         mgr_config.update({"device": own_device})
+                    # AMP defaults to True, and the inference manager now applies
+                    # autocast on whatever device it is given. On CPU that means
+                    # bfloat16 activations, which then meet float32 weights in the
+                    # parts of this forward that do not run under the manager --
+                    # the chunked ICL path especially. TabICLBaseEstimator resolves
+                    # "auto" to False on CPU for the same reason; mirror it.
+                    if own_device.type == "cpu":
+                        mgr_config.update({"use_amp": False})
             representations = self.row_interactor(
                 self.col_embedder(
                     X,
