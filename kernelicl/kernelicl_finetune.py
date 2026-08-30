@@ -77,10 +77,18 @@ class FinetuneConfig:
     memory tracks this rather than the effective batch. Once data generation is no
     longer the bottleneck this is the main speed lever: raising it means fewer, larger
     GPU launches for the same effective batch. Raise until it OOMs, then step back."""
-    lr_backbone: float = 1e-5
+    lr_backbone: float = 1e-4
     lr_head: float = 1e-3
     """Separate rates: the backbone is pretrained and needs nudging, the head starts
-    at identity and needs training."""
+    at identity and needs training.
+
+    The backbone rate matches TabICLv1's own pretraining. Measured over 80 steps with
+    everything else fixed, the rate does not change *whether* validation plateaus --
+    it does, within about twenty steps -- but it does change the level it plateaus at:
+    1.073 at 1e-5, 1.022 at 1e-4, 0.924 at 3e-4. Higher is tempting, but this is a
+    pretrained model and a rate high enough to reshape it quickly is also high enough
+    to damage what it already knows, which prior loss will not show. Check T5/T6 on
+    your own data before trusting a larger value."""
     weight_decay: float = 0.01
     warmup_steps: int = 200
     grad_clip: float = 1.0
@@ -94,6 +102,11 @@ class FinetuneConfig:
     # Validation and output.
     val_batches: int = 32
     val_every: int = 250
+    patience: int = 8
+    """Stop after this many validations without improvement. Training on the prior
+    saturates early -- the loss floor belongs to the random problems being generated,
+    not to the model -- so a full run often spends hours after the last gain. 0
+    disables it."""
     out_path: str = "kernelicl_finetuned.pt"
     """Written atomically every time validation improves, not only at the end, so an
     interrupted run keeps its best checkpoint. Point this at mounted Drive on Colab."""
@@ -327,6 +340,37 @@ def _split_micro_batches(batch, micro_batch: int):
 
 
 @torch.no_grad()
+def reference_loss(model, val_batches, cfg, device) -> float:
+    """Loss of TabICL's own MLP decoder on the same batches: the headroom baseline.
+
+    Printed once at the start so the training loss can be read against something. The
+    prior generates random problems, many of which are close to unlearnable, so a large
+    part of the loss is irreducible and the number that matters is the gap to this
+    reference rather than the absolute value.
+
+    Measured at init on synthetic batches: the MLP decoder reached 0.8722 and the
+    untrained kernel head 0.8839. There is not much room between them, which is why
+    training plateaus early -- the kernel head starts near what this architecture can
+    do on this data, and the floor belongs to the prior, not to the head.
+    """
+    model.train()   # prior batches mix class counts, which the eval path forbids
+    total, weight = 0.0, 0
+    for batch in val_batches:
+        X, y, _d, seq_lens, train_sizes = batch
+        seq_len, train_size = int(seq_lens[0]), int(train_sizes[0])
+        X = X[:, :seq_len].to(device, non_blocking=True)
+        y = y[:, :seq_len].to(device, non_blocking=True)
+        y_test = y[:, train_size:]
+        if y_test.shape[1] == 0:
+            continue
+        logits = model(X, y[:, :train_size])
+        n = y_test.numel()
+        total += F.cross_entropy(logits.flatten(end_dim=-2), y_test.long().flatten()).item() * n
+        weight += n
+    return total / weight if weight else float("nan")
+
+
+@torch.no_grad()
 def evaluate(model, head, val_batches, cfg, device, num_classes) -> dict:
     """Mean loss, accuracy and perplexity over a fixed set of prior batches.
 
@@ -407,8 +451,16 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
     val_batches = [mb for _ in range(cfg.val_batches)
                    for mb in _split_micro_batches(next(batches), cfg.micro_batch)]
 
+    # Two different reference points, and they answer different questions. This one is
+    # the architecture's floor: what TabICL's own head manages on the same problems.
+    # The `baseline` below is the starting point: what the untrained kernel head
+    # manages. Progress is measured against the second, headroom against the first.
+    mlp_floor = reference_loss(model, val_batches, cfg, device)
     accum = max(cfg.batch_size // cfg.micro_batch, 1)
     print(f"device={device} | amp={amp_on} | recompute={cfg.recompute}")
+    print(f"stock MLP decoder on these batches: {mlp_floor:.4f} -- roughly the floor for "
+          f"this architecture on this data,\n  so read the kernel loss as a gap to that, "
+          f"not as an absolute")
     print(f"training {sum(p.numel() for p in backbone_params) / 1e6:.1f}M backbone + "
           f"{sum(p.numel() for p in head_params) / 1e6:.2f}M head params")
     print(f"{cfg.steps} steps x {accum} x {cfg.micro_batch} datasets "
@@ -422,7 +474,7 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
           f"rel.PPL {100 * baseline['perplexity']:.1f}%  (pretrained, untrained head)\n")
 
     history = {"baseline": baseline, "step": [], "loss": [], "val": []}
-    best_val, saved_any = float("inf"), False
+    best_val, saved_any, since_best = float("inf"), False, 0
     started = time.perf_counter()
     data_seconds = 0.0
     last_log_time, last_log_step, last_log_data = started, -1, 0.0
@@ -486,11 +538,16 @@ def finetune(cfg: Optional[FinetuneConfig] = None, preset: str = "medium") -> di
                 _save_checkpoint(cfg.out_path, model, head, model_config, d_model,
                                  cfg, best_val)
                 saved_any = True
+            since_best = 0 if improved else since_best + 1
             gain = baseline["loss"] - metrics["loss"]
             print(f"  [val] step {step:>5}  loss {metrics['loss']:.4f}  "
                   f"acc {metrics['accuracy']:.3f}  rel.PPL {100 * metrics['perplexity']:.1f}%  "
                   f"({gain:+.4f} vs baseline)"
-                  f"{'  <- best, saved' if improved else ''}")
+                  f"{'  <- best, saved' if improved else f'  [{since_best}/{cfg.patience}]'}")
+            if cfg.patience and since_best >= cfg.patience:
+                print(f"\nstopping at step {step}: {cfg.patience} validations without "
+                      f"improvement. The best checkpoint is already saved.")
+                break
 
     if not saved_any:
         print("\nno validation checkpoint was taken; nothing saved")
