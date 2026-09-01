@@ -64,6 +64,7 @@ Written to be pasted into Colab cells. Only one dependency between them.
 | `kernelicl_analysis.py` | T1–T4, F1/F3/F4/F7/F8 | clinical, data |
 | `kernelicl_embeddings.py` | T5, T6, E1–E4 | clinical, data |
 | `kernelicl_shift.py` | corruption testing: S1–S2, G1–G3 | clinical, data |
+| `kernelicl_feature_corruption.py` | per-feature corruption sweep, F9 | clinical, data, fitted models |
 | `kernelicl_finetune.py` | trains the embedding for the kernel | — |
 
 ### Setup
@@ -110,6 +111,7 @@ not appear on the plots.
 | **F3** | per-prediction weight distribution | how much evidence, and how concentrated |
 | **F7** | weights in embedding space | where that evidence sits |
 | **F8** | the six-panel evidence figure | one figure for a write-up |
+| **F9** | four corruptions x three views of the evidence | *why* a corruption costs accuracy |
 | **T5 / T6 / E1** | purity, raw vs `TF_row` vs `TF_icl` | whether to fine-tune |
 | **E2** | test cases over training, and error locations | extrapolation, and clustered failure |
 | **E3** | evidence base across the space | sanity check on the scale |
